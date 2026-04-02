@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 /// Abstraction over checksum algorithms. Swap the implementing type to change
@@ -117,7 +118,9 @@ impl<C: Checksum> Wal<C> {
         let key_len = key.len() as u32;
         let val_len = value.len() as u32;
 
-        let mut payload = Vec::with_capacity(8 + 1 + 4 + key.len() + 4 + value.len());
+        let mut payload = Vec::with_capacity(
+            size_of::<u64>() + size_of::<u8>() + size_of::<u32>() + key.len() + size_of::<u32>() + value.len(),
+        );
         payload.extend_from_slice(&seq_num.to_le_bytes());
         payload.push(op_type);
         payload.extend_from_slice(&key_len.to_le_bytes());
@@ -180,7 +183,7 @@ pub fn replay<C: Checksum>(path: &Path) -> io::Result<Vec<WalRecord>> {
         }
 
         // Reconstruct the payload in the same order it was written.
-        let mut payload = Vec::with_capacity(header.len() + key_len + 4 + val_len);
+        let mut payload = Vec::with_capacity(header.len() + key_len + size_of::<u32>() + val_len);
         payload.extend_from_slice(&header);
         payload.extend_from_slice(&key_buf);
         payload.extend_from_slice(&val_len_buf);
@@ -243,12 +246,10 @@ mod tests {
     use std::io::Write;
 
     fn make_test_dir() -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let path = std::env::temp_dir().join(format!("copperdb_test_{}", nanos));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("copperdb_test_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
