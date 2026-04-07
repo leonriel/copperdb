@@ -1,7 +1,7 @@
 use std::cmp;
 use std::mem::size_of;
 
-use crate::sstable::{block::BlockError, writer::WriterError, reader::ReaderError};
+use crate::sstable::{block::BlockError, reader::ReaderError, writer::WriterError};
 
 pub mod block;
 pub mod reader;
@@ -37,7 +37,7 @@ pub struct InternalKey {
 impl Ord for InternalKey {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         match self.user_key.cmp(&other.user_key) {
-            cmp::Ordering::Equal => other.seq_num.cmp(&self.seq_num), 
+            cmp::Ordering::Equal => other.seq_num.cmp(&self.seq_num),
             ord => ord,
         }
     }
@@ -52,7 +52,7 @@ impl PartialOrd for InternalKey {
 pub trait KvIterator: Send {
     /// Returns the next Key, Value, and Sequence Number
     fn next(&mut self) -> Option<(String, Record, u64)>;
-    
+
     /// True if the iterator is exhausted
     fn is_valid(&self) -> bool;
 }
@@ -72,7 +72,10 @@ impl TryFrom<u8> for RecordTag {
         match value {
             0 => Ok(RecordTag::Delete),
             1 => Ok(RecordTag::Put),
-            _ => Err(BlockError::CorruptData(format!("Encountered invalid RecordTag byte: {}", value))),
+            _ => Err(BlockError::CorruptData(format!(
+                "Encountered invalid RecordTag byte: {}",
+                value
+            ))),
         }
     }
 }

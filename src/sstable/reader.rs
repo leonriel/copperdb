@@ -1,7 +1,10 @@
+use crate::sstable::block::{Block, BlockError};
+use crate::sstable::{
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, InternalKey, MAGIC_NUMBER, MAGIC_SIZE,
+    MagicNumber, Record,
+};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use crate::sstable::block::{Block, BlockError};
-use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, InternalKey, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber, Record};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReaderError {
@@ -32,12 +35,14 @@ impl SsTableReader {
 
         // The smallest valid SSTable is just a footer
         if file_len < (FOOTER_SIZE as u64) {
-            return Err(ReaderError::CorruptData("File too short to contain a valid footer".to_string()));
+            return Err(ReaderError::CorruptData(
+                "File too short to contain a valid footer".to_string(),
+            ));
         }
 
         // 1. Read the footer
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
-        
+
         // FOOTER_SIZE is already a usize, so no casting needed here
         let mut footer_buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer_buf)?;
@@ -47,16 +52,14 @@ impl SsTableReader {
         let magic_end = index_end + MAGIC_SIZE;
 
         // Safely attempt to convert the slices into 8-byte arrays
-        let index_offset = u64::from_be_bytes(
-            footer_buf[0..index_end]
-                .try_into()
-                .map_err(|_| ReaderError::CorruptData("Failed to parse index offset from footer".to_string()))?
-        );
-        let magic = u64::from_be_bytes(
-            footer_buf[index_end..magic_end]
-                .try_into()
-                .map_err(|_| ReaderError::CorruptData("Failed to parse magic number from footer".to_string()))?
-        );
+        let index_offset =
+            u64::from_be_bytes(footer_buf[0..index_end].try_into().map_err(|_| {
+                ReaderError::CorruptData("Failed to parse index offset from footer".to_string())
+            })?);
+        let magic =
+            u64::from_be_bytes(footer_buf[index_end..magic_end].try_into().map_err(|_| {
+                ReaderError::CorruptData("Failed to parse magic number from footer".to_string())
+            })?);
 
         if magic != MAGIC_NUMBER {
             return Err(ReaderError::InvalidMagicNumber(magic));
@@ -79,7 +82,10 @@ impl SsTableReader {
 
     /// Searches for a specific user key in the SSTable.
     /// Returns Ok(None) if the key does not exist in this file.
-    pub fn search(&mut self, target_key: &str) -> Result<Option<(InternalKey, Record)>, ReaderError> {
+    pub fn search(
+        &mut self,
+        target_key: &str,
+    ) -> Result<Option<(InternalKey, Record)>, ReaderError> {
         let num_offsets = self.index_block.get_num_offsets()?;
 
         if num_offsets == 0 {
@@ -87,34 +93,42 @@ impl SsTableReader {
         }
 
         let mut target_block_offset = None;
-        let mut next_block_offset = self.index_offset; 
+        let mut next_block_offset = self.index_offset;
 
         for i in 0..num_offsets {
             let entry_offset = self.index_block.get_offset(i, num_offsets)?;
             let (key, record) = self.index_block.decode_entry(entry_offset)?;
-            
+
             // Safely convert the dynamic Vec<u8> into a fixed 8-byte array
             let block_start = match record {
-                Record::Put(val) => u64::from_be_bytes(
-                    val.try_into()
-                       .map_err(|_| ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string()))?
-                ),
-                Record::Delete => return Err(ReaderError::CorruptData("Index block contains Delete record".to_string())),
+                Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
+                    ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string())
+                })?),
+                Record::Delete => {
+                    return Err(ReaderError::CorruptData(
+                        "Index block contains Delete record".to_string(),
+                    ));
+                }
             };
 
             if key.user_key.as_str() <= target_key {
                 target_block_offset = Some(block_start);
-                
+
                 if i + 1 < num_offsets {
                     let next_entry_offset = self.index_block.get_offset(i + 1, num_offsets)?;
                     let (_, next_record) = self.index_block.decode_entry(next_entry_offset)?;
-                    
+
                     next_block_offset = match next_record {
-                        Record::Put(val) => u64::from_be_bytes(
-                            val.try_into()
-                               .map_err(|_| ReaderError::CorruptData("Next index block pointer is not 8 bytes".to_string()))?
-                        ),
-                        Record::Delete => return Err(ReaderError::CorruptData("Next index block contains Delete record".to_string())),
+                        Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
+                            ReaderError::CorruptData(
+                                "Next index block pointer is not 8 bytes".to_string(),
+                            )
+                        })?),
+                        Record::Delete => {
+                            return Err(ReaderError::CorruptData(
+                                "Next index block contains Delete record".to_string(),
+                            ));
+                        }
                     };
                 } else {
                     next_block_offset = self.index_offset;
@@ -127,13 +141,13 @@ impl SsTableReader {
         // 2. Read the specific Data Block from disk and search it
         if let Some(start_offset) = target_block_offset {
             let block_size = next_block_offset - start_offset;
-            
+
             self.file.seek(SeekFrom::Start(start_offset))?;
             let mut block_data = vec![0u8; block_size as usize];
             self.file.read_exact(&mut block_data)?;
-            
+
             let data_block = Block::decode(block_data);
-            
+
             return Ok(data_block.search(target_key)?);
         }
 
@@ -144,12 +158,12 @@ impl SsTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::path::PathBuf;
+    use crate::sstable::KvIterator;
     use crate::sstable::Record;
     use crate::sstable::writer::SsTableBuilder;
-    use crate::sstable::KvIterator; // Assuming this is where KvIterator lives
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf; // Assuming this is where KvIterator lives
 
     // =========================================================================
     // Test Helpers
@@ -164,7 +178,7 @@ mod tests {
         fn new(entries: Vec<(String, Record, u64)>) -> Self {
             let mut entries_iter = entries.into_iter();
             let current = entries_iter.next();
-            Self { 
+            Self {
                 entries: entries_iter,
                 current,
             }
@@ -194,7 +208,7 @@ mod tests {
             let _ = fs::remove_file(&path);
             Self { path }
         }
-        
+
         fn path_str(&self) -> &str {
             self.path.to_str().unwrap()
         }
@@ -224,7 +238,7 @@ mod tests {
     #[test]
     fn test_reader_open_file_too_short() {
         let file = TempFileGuard::new("too_short.sst");
-        
+
         // Write a 10-byte file (smaller than our 16-byte FOOTER_SIZE)
         {
             let mut f = File::create(&file.path).unwrap();
@@ -243,7 +257,7 @@ mod tests {
     #[test]
     fn test_reader_open_invalid_magic() {
         let file = TempFileGuard::new("bad_magic.sst");
-        
+
         // Write exactly 16 bytes, but with a bad magic number
         {
             let mut f = File::create(&file.path).unwrap();
@@ -265,13 +279,16 @@ mod tests {
     #[test]
     fn test_reader_search_single_block() {
         let file = TempFileGuard::new("read_single_block.sst");
-        
+
         // 3 entries will easily fit in one 4KB block
-        build_test_sst(file.path_str(), vec![
-            ("apple".to_string(), Record::Put(b("red")), 3),
-            ("banana".to_string(), Record::Put(b("yellow")), 2),
-            ("cherry".to_string(), Record::Delete, 1),
-        ]);
+        build_test_sst(
+            file.path_str(),
+            vec![
+                ("apple".to_string(), Record::Put(b("red")), 3),
+                ("banana".to_string(), Record::Put(b("yellow")), 2),
+                ("cherry".to_string(), Record::Delete, 1),
+            ],
+        );
 
         let mut reader = SsTableReader::open(file.path_str()).unwrap();
 
@@ -282,7 +299,10 @@ mod tests {
         assert!(matches!(r1, Record::Put(v) if v == b("red")));
 
         // 2. Search for existing Delete
-        let (k2, r2) = reader.search("cherry").unwrap().expect("cherry should exist");
+        let (k2, r2) = reader
+            .search("cherry")
+            .unwrap()
+            .expect("cherry should exist");
         assert_eq!(k2.user_key, "cherry");
         assert_eq!(k2.seq_num, 1);
         assert!(matches!(r2, Record::Delete));
@@ -291,7 +311,7 @@ mod tests {
     #[test]
     fn test_reader_search_multiple_blocks() {
         let file = TempFileGuard::new("read_multi_block.sst");
-        
+
         let mut entries = Vec::new();
         // Create 10 entries with 1000 byte values. This will force multiple blocks.
         for i in 0..10 {
@@ -302,7 +322,7 @@ mod tests {
             padded_val.resize(1000, 0);
             entries.push((key, Record::Put(padded_val), 100 - i));
         }
-        
+
         build_test_sst(file.path_str(), entries);
 
         let mut reader = SsTableReader::open(file.path_str()).unwrap();
@@ -311,11 +331,14 @@ mod tests {
         let test_indices = [0, 5, 9];
         for i in test_indices {
             let target_key = format!("key_{:02}", i);
-            let (k, r) = reader.search(&target_key).unwrap().expect("Key should exist");
-            
+            let (k, r) = reader
+                .search(&target_key)
+                .unwrap()
+                .expect("Key should exist");
+
             assert_eq!(k.user_key, target_key);
             assert_eq!(k.seq_num, 100 - i);
-            
+
             if let Record::Put(val) = r {
                 let expected_prefix = format!("val_{:02}", i).into_bytes();
                 assert_eq!(&val[0..6], &expected_prefix[..]);
@@ -329,25 +352,37 @@ mod tests {
     #[test]
     fn test_reader_search_not_present() {
         let file = TempFileGuard::new("read_not_present.sst");
-        
-        build_test_sst(file.path_str(), vec![
-            ("b_key".to_string(), Record::Put(b("b")), 2),
-            ("d_key".to_string(), Record::Put(b("d")), 1),
-            ("f_key".to_string(), Record::Put(b("f")), 0),
-        ]);
+
+        build_test_sst(
+            file.path_str(),
+            vec![
+                ("b_key".to_string(), Record::Put(b("b")), 2),
+                ("d_key".to_string(), Record::Put(b("d")), 1),
+                ("f_key".to_string(), Record::Put(b("f")), 0),
+            ],
+        );
 
         let mut reader = SsTableReader::open(file.path_str()).unwrap();
 
         // 1. Target key is lexicographically smaller than the first key
         let res_before = reader.search("a_key").unwrap();
-        assert!(res_before.is_none(), "Should return None for key smaller than first entry");
+        assert!(
+            res_before.is_none(),
+            "Should return None for key smaller than first entry"
+        );
 
         // 2. Target key falls between two existing keys (between b_key and d_key)
         let res_middle = reader.search("c_key").unwrap();
-        assert!(res_middle.is_none(), "Should return None for missing key in the middle of a block");
+        assert!(
+            res_middle.is_none(),
+            "Should return None for missing key in the middle of a block"
+        );
 
         // 3. Target key is lexicographically larger than the last key
         let res_after = reader.search("z_key").unwrap();
-        assert!(res_after.is_none(), "Should return None for key larger than last entry");
+        assert!(
+            res_after.is_none(),
+            "Should return None for key larger than last entry"
+        );
     }
 }
