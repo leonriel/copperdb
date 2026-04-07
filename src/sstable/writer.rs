@@ -2,7 +2,8 @@
 use std::fs::File;
 use std::io::Write;
 
-use crate::sstable::block::{BlockBuilder, InternalKey, Record}; 
+use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, InternalKey, KvIterator, MAGIC_NUMBER, MAGIC_SIZE, Record};
+use crate::sstable::block::{BlockBuilder}; 
 
 #[derive(thiserror::Error, Debug)]
 pub enum WriterError {
@@ -13,20 +14,12 @@ pub enum WriterError {
     InvalidData(String),
 }
 
-pub trait KvIterator: Send {
-    /// Returns the next Key, Value, and Sequence Number
-    fn next(&mut self) -> Option<(String, Record, u64)>;
-    
-    /// True if the iterator is exhausted
-    fn is_valid(&self) -> bool;
-}
-
 pub struct SsTableBuilder {
     file: File,
     current_block: BlockBuilder,
     /// Stores the first key of each block and the block's physical byte offset in the file
     block_index: Vec<(String, u64)>, 
-    current_offset: u64,
+    current_offset: IndexOffset,
     /// Tracks the first user_key added to the current block
     first_key_of_current_block: Option<String>,
 }
@@ -102,9 +95,12 @@ impl SsTableBuilder {
         self.current_offset += index_data.len() as u64;
 
         // Write a fixed-size Footer (16 bytes)
-        let mut footer = [0u8; 16];
-        footer[0..8].copy_from_slice(&index_offset.to_be_bytes());
-        footer[8..16].copy_from_slice(&0xDEADBEEFCAFEBABEu64.to_be_bytes());
+        let mut footer = [0u8; FOOTER_SIZE];
+        let index_end = INDEX_OFFSET_SIZE;
+        let magic_end = index_end + MAGIC_SIZE;
+
+        footer[0..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
         
         self.file.write_all(&footer)?;
         self.file.sync_all()?;
@@ -143,9 +139,9 @@ impl SsTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, iter::Peekable};
+    use std::fs;
     use std::path::PathBuf;
-    use crate::sstable::block::{Block, Record};
+    use crate::sstable::block::Block;
 
     // =========================================================================
     // Test Helpers
@@ -245,17 +241,17 @@ mod tests {
         let data = fs::read(&file.path).unwrap();
         
         // Even empty, it should have an empty Index Block + 16 byte Footer
-        assert!(data.len() >= 16);
+        assert!(data.len() >= FOOTER_SIZE);
         
         let len = data.len();
         let magic = u64::from_be_bytes(data[len - 8..len].try_into().unwrap());
         assert_eq!(magic, 0xDEADBEEFCAFEBABEu64, "Footer magic number is missing/corrupted");
 
-        let index_offset = u64::from_be_bytes(data[len - 16..len - 8].try_into().unwrap()) as usize;
+        let index_offset = u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
         assert_eq!(index_offset, 0, "Since there are no data blocks, index offset should be 0");
         
         // Decode the index block
-        let index_block_data = data[index_offset..len - 16].to_vec();
+        let index_block_data = data[index_offset..len - FOOTER_SIZE].to_vec();
         let index_block = Block::decode(index_block_data);
         assert_eq!(index_block.get_num_offsets().unwrap(), 0, "Index block should be empty");
     }
@@ -279,10 +275,10 @@ mod tests {
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
         
-        let index_offset = u64::from_be_bytes(data[len - 16..len - 8].try_into().unwrap()) as usize;
+        let index_offset = u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
         
         // 1. Verify Index Block
-        let index_data = data[index_offset..len - 16].to_vec();
+        let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
         let index_block = Block::decode(index_data);
         
         assert_eq!(index_block.get_num_offsets().unwrap(), 1, "There should be exactly 1 data block indexed");
@@ -330,10 +326,10 @@ mod tests {
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
         
-        let index_offset = u64::from_be_bytes(data[len - 16..len - 8].try_into().unwrap()) as usize;
+        let index_offset = u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
         
         // 1. Verify Index Block has multiple pointers
-        let index_data = data[index_offset..len - 16].to_vec();
+        let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
         let index_block = Block::decode(index_data);
         
         let num_data_blocks = index_block.get_num_offsets().unwrap();
