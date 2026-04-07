@@ -90,13 +90,25 @@ pub trait TableBuilder {
 
 ## Feature: Write-Ahead Log (WAL)
 
-> **Owner: You (Partner B)**
+> **Owner: Fernando (Partner B)**
 > **Module: `wal.rs`**
-> **Status: TO BE IMPLEMENTED**
+> **Status: IMPLEMENTED**
 
 ### Purpose
 
 The WAL guarantees crash recovery for data that lives in the MemTable but hasn't been flushed to an SSTable yet. It is append-only. Each active MemTable is paired with exactly one WAL file.
+
+### Summary
+
+Append-only binary log using a generic `Checksum` trait so the hashing algorithm can be swapped without touching I/O logic. The default implementation uses CRC32 (`crc32fast`). Files are named by zero-padded generation number (`00000000000000000001.wal`) so lexicographic order matches numeric order, enabling correct multi-file replay without additional metadata.
+
+### Key Structures
+
+- **`Checksum`** — Trait with `compute(data) -> u32` and a default `verify` method. Decouples checksum algorithm from record I/O.
+- **`Crc32Checksum`** — Production implementation backed by `crc32fast`.
+- **`WalOpType`** — Enum: `Put` or `Delete`.
+- **`WalRecord`** — Decoded record returned by `replay`: `{ seq_num, op, key, value }`.
+- **`Wal<C>`** — The active writer. Wraps a `BufWriter<File>` and owns the file path and generation number. Created with `Wal::create(dir, generation)` — fails if the file already exists.
 
 ### Record Format
 
@@ -104,13 +116,20 @@ Each WAL entry is a binary record with the following layout:
 
 | Field       | Size     | Description                           |
 |-------------|----------|---------------------------------------|
-| Checksum    | 4 bytes  | Integrity check for the record        |
+| Checksum    | 4 bytes  | CRC32 over every byte after this field |
 | Seq Number  | 8 bytes  | Monotonically increasing sequence ID  |
-| OpType      | 1 byte   | `Put` or `Delete`                     |
-| Key Len     | 4 bytes  | Length of the key in bytes             |
+| OpType      | 1 byte   | `0x01` = Put, `0x02` = Delete         |
+| Key Len     | 4 bytes  | Length of the key in bytes            |
 | Key         | Variable | The key bytes                         |
-| Value Len   | 4 bytes  | Length of the value in bytes           |
+| Value Len   | 4 bytes  | Length of the value in bytes          |
 | Value       | Variable | The value bytes (empty for deletes)   |
+
+All multi-byte integers are little-endian.
+
+### Recovery
+
+- **`replay(path)`** — Reads one WAL file. Stops at the first record whose checksum fails — that record was a partial write interrupted by a crash. All prior records are returned as valid.
+- **`recover_all(dir)`** — Scans a directory for all `*.wal` files, sorts them by generation number, and calls `replay` on each in order. Called by `LsmEngine::open` on startup. WAL files for already-flushed MemTables will have been deleted, so only unflushed generations are present.
 
 ### Responsibilities
 
@@ -123,20 +142,18 @@ Each WAL entry is a binary record with the following layout:
 
 - **`db.rs` (LsmEngine):** The engine coordinates the WAL. On every write, `db.rs` calls WAL append, then MemTable insert. On startup, `db.rs` calls WAL replay to rebuild the MemTable.
 - **`memtable.rs`:** During replay, the WAL feeds records back into the MemTable using the same `put` interface.
-- **Background Flusher:** After a successful flush to SSTable, the flusher signals that the old WAL can be deleted.
+- **Background Flusher (Phase 2):** After a successful flush to SSTable, the flusher signals that the old WAL can be deleted via `Wal::delete`.
 
-### Key Design Decisions
+### Known Limitations
 
-- The WAL is **append-only** — never modified in place.
-- The **checksum** (CRC32 recommended) protects against partial/corrupt writes from crashes mid-append.
-- During recovery, if a record fails its checksum, stop replay at that point — all prior records are valid, and the partial record represents a write that never completed.
-- Each WAL file should be named or numbered to associate it with its MemTable generation.
+- **WAL–MemTable pairing race:** In a concurrent scenario, writes that arrive between a MemTable freeze and the subsequent WAL rotation are appended to the old WAL but inserted into the new MemTable. No data is lost today (all WAL files are replayed on recovery), but when Phase 2 introduces WAL deletion, the flusher must account for this — deleting a WAL file is only safe once it can be confirmed that all its records are covered by a flushed SSTable.
+- **No fsync per write:** `append_put`/`append_delete` flush the `BufWriter` to the OS page cache but do not call `fsync`. Data survives process crashes but not power loss. Call `Wal::sync()` for stronger durability guarantees at the cost of one fsync per write.
 
 ---
 
 ## Feature: MemTable
 
-> **Owner: Partner A**
+> **Owner: Gabriel (Partner A)**
 > **Module: `memtable.rs`**
 > **Status: ALREADY IMPLEMENTED**
 
@@ -282,12 +299,12 @@ Scale the engine using the **Raft consensus algorithm**. The Raft log serves as 
 
 ## Timeline
 
-| Phase | Dates | Partner A | Partner B (You) |
+| Phase | Dates | Gabriel (Partner A) | Fernando / You (Partner B) |
 |-------|-------|-----------|-----------------|
-| **1: In-Memory Engine & Durability** | Mar 30 – Apr 4 | SkipList MemTable + core API | **WAL:** append logic + recovery replay |
-| **2: Disk Persistence** | Apr 5 – Apr 9 | SSTable Writer | Background flusher + **Manifest file** |
-| **3: Read Path & Compaction** | Apr 10 – Apr 13 | SSTable Reader + full get path | **Compaction Worker** (K-way merge) |
-| **4: Networking & Polish** | Apr 14 – Apr 16 | Tokio HTTP Server | Integration testing + benchmarking |
+| **1: In-Memory Engine & Durability** | Mar 30 – Apr 4 | Gabriel: SkipList MemTable + core API | **Fernando: WAL** — append logic + recovery replay |
+| **2: Disk Persistence** | Apr 5 – Apr 9 | Gabriel: SSTable Writer | **Fernando:** Background flusher + **Manifest file** |
+| **3: Read Path & Compaction** | Apr 10 – Apr 13 | Gabriel: SSTable Reader + full get path | **Fernando: Compaction Worker** (K-way merge) |
+| **4: Networking & Polish** | Apr 14 – Apr 16 | Gabriel: Tokio HTTP Server | **Fernando:** Integration testing + benchmarking |
 
 ### Milestones
 
