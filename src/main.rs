@@ -1,3 +1,4 @@
+mod db;
 mod memtable;
 mod wal;
 

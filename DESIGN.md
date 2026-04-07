@@ -190,6 +190,62 @@ Lock-free concurrent skip list (`crossbeam-skiplist`) serving as the in-memory w
 
 ---
 
+## Feature: Engine Coordinator
+
+> **Owner: Fernando (Partner B)**
+> **Module: `db.rs`**
+> **Status: IMPLEMENTED**
+
+### Summary
+
+`LsmEngine` is the central coordinator that glues `MemTableState` and `Wal` together into a single public interface. It owns the global sequence number counter and the active WAL, and is the only component that knows about both. Designed to be shared across threads via `Arc<LsmEngine>` — all methods take `&self`.
+
+### Key Structures
+
+- **`LsmEngine`** — The top-level engine struct. Fields:
+  - `state: MemTableState` — manages the active and immutable MemTables
+  - `active_wal: Mutex<Wal<Crc32Checksum>>` — the WAL file paired with the current active MemTable
+  - `next_seq: AtomicU64` — monotonically increasing sequence number, shared across all writes
+  - `next_wal_gen: AtomicU64` — generation counter for naming new WAL files on rotation
+  - `data_dir: PathBuf` — directory where WAL files are stored
+
+### Write Path
+
+1. Atomically fetch-and-increment `next_seq` to claim a unique sequence number
+2. Lock the WAL mutex, append the record, release the lock
+3. Insert into `MemTableState` (lock-free at the skip list level)
+4. If `MemTableState::put` returns `true` (freeze occurred), call `rotate_wal`
+
+### Read Path
+
+1. Delegate to `MemTableState::get` — checks the active MemTable, then immutables in reverse chronological order
+2. Translate the internal `Record` enum to the public API: `Record::Put(v)` → `Some(v)`, `Record::Delete` → `None`
+
+### Recovery (`open`)
+
+1. Call `recover_all` to replay all `*.wal` files in the data directory in generation order
+2. Compute the highest existing WAL generation to continue numbering from
+3. Set `next_seq` to `max_replayed_seq + 1` so post-recovery writes never reuse a sequence number
+4. Replay each record into `MemTableState` (freeze signals are ignored during replay — no WAL writes happen)
+5. Create a new WAL file at `next_gen` for ongoing writes
+
+### WAL Rotation
+
+When a freeze occurs, `rotate_wal` increments `next_wal_gen`, creates a new WAL file, and replaces the one inside the Mutex. The old WAL file remains on disk, paired with the now-immutable MemTable, until Phase 2 deletes it after a successful SSTable flush.
+
+### Configuration
+
+- `MAX_MEMTABLE_SIZE`: **64 MB**
+- `MAX_IMMUTABLE_TABLES`: **4**
+
+### Known Limitations
+
+- **WAL–MemTable pairing race:** See WAL Known Limitations. The engine inherits this issue — it is a Phase 2 concern.
+- **Backpressure not wired:** `MemTableState::is_flush_falling_behind` is never checked. Writes are not stalled when immutable MemTables accumulate past the limit of 4. This is intentional until the background flusher exists in Phase 2.
+- **WAL not fsynced:** Writes survive process crashes but not power loss. Calling `Wal::sync()` after each append would provide stronger guarantees at the cost of one fsync per write.
+
+---
+
 ## Feature: SSTables (On-Disk Storage)
 
 > **Module: `sstable/` (writer.rs, reader.rs, block.rs)**
