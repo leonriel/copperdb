@@ -121,16 +121,16 @@ impl<C: Checksum> Wal<C> {
         let mut payload = Vec::with_capacity(
             size_of::<u64>() + size_of::<u8>() + size_of::<u32>() + key.len() + size_of::<u32>() + value.len(),
         );
-        payload.extend_from_slice(&seq_num.to_le_bytes());
+        payload.extend_from_slice(&seq_num.to_be_bytes());
         payload.push(op_type);
-        payload.extend_from_slice(&key_len.to_le_bytes());
+        payload.extend_from_slice(&key_len.to_be_bytes());
         payload.extend_from_slice(key);
-        payload.extend_from_slice(&val_len.to_le_bytes());
+        payload.extend_from_slice(&val_len.to_be_bytes());
         payload.extend_from_slice(value);
 
         let checksum = C::compute(&payload);
 
-        self.writer.write_all(&checksum.to_le_bytes())?;
+        self.writer.write_all(&checksum.to_be_bytes())?;
         self.writer.write_all(&payload)?;
         // Flush the BufWriter on every record so the OS has the bytes even if
         // we skip fsync. A full sync() is available for stricter guarantees.
@@ -155,16 +155,16 @@ pub fn replay<C: Checksum>(path: &Path) -> io::Result<Vec<WalRecord>> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         }
-        let expected = u32::from_le_bytes(checksum_buf);
+        let expected = u32::from_be_bytes(checksum_buf);
 
         // seq_num (8) + op_type (1) + key_len (4)
         let mut header = [0u8; 13];
         if reader.read_exact(&mut header).is_err() {
             break;
         }
-        let seq_num = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let seq_num = u64::from_be_bytes(header[0..8].try_into().unwrap());
         let op_type = header[8];
-        let key_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+        let key_len = u32::from_be_bytes(header[9..13].try_into().unwrap()) as usize;
 
         let mut key_buf = vec![0u8; key_len];
         if reader.read_exact(&mut key_buf).is_err() {
@@ -175,7 +175,7 @@ pub fn replay<C: Checksum>(path: &Path) -> io::Result<Vec<WalRecord>> {
         if reader.read_exact(&mut val_len_buf).is_err() {
             break;
         }
-        let val_len = u32::from_le_bytes(val_len_buf) as usize;
+        let val_len = u32::from_be_bytes(val_len_buf) as usize;
 
         let mut val_buf = vec![0u8; val_len];
         if reader.read_exact(&mut val_buf).is_err() {
