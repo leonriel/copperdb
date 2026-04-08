@@ -2,47 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_skiplist::SkipMap;
 use std::ops::Bound;
-use std::cmp;
+
+use crate::core::{InternalKey, Record, KvIterator};
 
 pub mod state;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InternalKey {
-    pub user_key: String,
-    pub seq_num: u64,
-}
-
-impl Ord for InternalKey {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        // 1. Sort by the string alphabetically first
-        match self.user_key.cmp(&other.user_key) {
-            // 2. If the strings are the same, sort by seq_num DESCENDING
-            cmp::Ordering::Equal => other.seq_num.cmp(&self.seq_num), 
-            ord => ord,
-        }
-    }
-}
-
-impl PartialOrd for InternalKey {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Represents the state of a key at a specific point in time.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Record {
-    Put(Vec<u8>),
-    Delete, // Acts as the tombstone
-}
-
-pub trait KvIterator: Send {
-    /// Returns the next Key, Value, and Sequence Number
-    fn next(&mut self) -> Option<(String, Record, u64)>;
-    
-    /// True if the iterator is exhausted
-    fn is_valid(&self) -> bool;
-}
 
 /// A standard return type for queries.
 pub type QueryResult = Option<(Record, u64)>;
