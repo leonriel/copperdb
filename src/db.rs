@@ -1,11 +1,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock, Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
+use crate::versioning::{Manifest, VersionEdit, VersionState};
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
@@ -21,6 +22,9 @@ pub struct LsmEngine {
     next_seq: AtomicU64,
     next_wal_gen: AtomicU64,
     data_dir: PathBuf,
+    manifest: Mutex<Manifest>,
+    version: RwLock<Arc<VersionState>>,
+    next_sst_id: AtomicU64,
 }
 
 impl LsmEngine {
@@ -53,12 +57,19 @@ impl LsmEngine {
         // Create the active WAL file for new user writes
         let active_wal = Wal::<Crc32Checksum>::create(dir, next_gen)?;
 
+        let (manifest, version_state) = Manifest::open_or_create(dir)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let next_sst_id = version_state.all_file_ids().max().unwrap_or(0) + 1;
+
         Ok(Self {
             state,
             active_wal: Mutex::new(active_wal),
             next_seq: AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir: dir.to_path_buf(),
+            manifest: Mutex::new(manifest),
+            version: RwLock::new(Arc::new(version_state)),
+            next_sst_id: AtomicU64::new(next_sst_id),
         })
     }
 
@@ -104,6 +115,78 @@ impl LsmEngine {
         if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
+
+        Ok(())
+    }
+
+    /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
+    pub fn alloc_sst_id(&self) -> u64 {
+        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Expose a read snapshot of the current version for the flusher and
+    /// compaction worker. Callers get an Arc clone without holding the lock.
+    pub fn current_version(&self) -> Arc<VersionState> {
+        Arc::clone(&self.version.read().unwrap())
+    }
+
+    /// Called by the flusher after successfully writing an SSTable file.
+    /// Persists the version edit to disk first, then atomically updates the
+    /// in-memory VersionState via CoW (matching MemTableState's freeze pattern).
+    pub fn record_flush(
+        &self,
+        file_id: u64,
+        smallest_key: String,
+        largest_key: String,
+    ) -> io::Result<()> {
+        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
+
+        self.manifest.lock().unwrap().append(&edit)?;
+
+        let mut guard = self.version.write().unwrap();
+        let mut new_version = (**guard).clone();
+        new_version.apply(&edit);
+        *guard = Arc::new(new_version);
+
+        Ok(())
+    }
+
+    /// Called by the compaction worker after merging files. Records all version
+    /// edits in one logical batch: removals of inputs, additions of outputs.
+    pub fn record_compaction(
+        &self,
+        removed: &[(u8, u64)],
+        added: &[(u8, u64, String, String)],
+    ) -> io::Result<()> {
+        let mut manifest = self.manifest.lock().unwrap();
+
+        for &(level, file_id) in removed {
+            manifest.append(&VersionEdit::RemoveFile { level, file_id })?;
+        }
+        for (level, file_id, smallest_key, largest_key) in added {
+            manifest.append(&VersionEdit::AddFile {
+                level:        *level,
+                file_id:      *file_id,
+                smallest_key: smallest_key.clone(),
+                largest_key:  largest_key.clone(),
+            })?;
+        }
+        drop(manifest);
+
+        let mut guard = self.version.write().unwrap();
+        let mut new_version = (**guard).clone();
+        for &(level, file_id) in removed {
+            new_version.apply(&VersionEdit::RemoveFile { level, file_id });
+        }
+        for (level, file_id, smallest_key, largest_key) in added {
+            new_version.apply(&VersionEdit::AddFile {
+                level:        *level,
+                file_id:      *file_id,
+                smallest_key: smallest_key.clone(),
+                largest_key:  largest_key.clone(),
+            });
+        }
+        *guard = Arc::new(new_version);
 
         Ok(())
     }
