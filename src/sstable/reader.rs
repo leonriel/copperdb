@@ -1,8 +1,7 @@
 use crate::core::{InternalKey, Record};
 use crate::sstable::block::{Block, BlockError};
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE,
-    MagicNumber,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber,
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -22,6 +21,12 @@ pub enum ReaderError {
     CorruptData(String),
 }
 
+/// Provides point-lookup access to an on-disk SSTable file.
+///
+/// On `open`, the footer is validated (magic number check) and the index
+/// block is loaded into memory. Subsequent `search` calls use the index to
+/// locate candidate data blocks, reading at most two blocks from disk to
+/// find the newest version of a key.
 pub struct SsTableReader {
     file: File,
     index_block: Block,
@@ -83,7 +88,10 @@ impl SsTableReader {
 
     /// Searches for a specific user key in the SSTable.
     /// Returns Ok(None) if the key does not exist in this file.
-    pub fn search(&mut self, target_key: &str) -> Result<Option<(InternalKey, Record)>, ReaderError> {
+    pub fn search(
+        &mut self,
+        target_key: &str,
+    ) -> Result<Option<(InternalKey, Record)>, ReaderError> {
         let num_offsets = self.index_block.get_num_offsets()?;
 
         if num_offsets == 0 {
@@ -97,25 +105,31 @@ impl SsTableReader {
         for i in 0..num_offsets {
             let entry_offset = self.index_block.get_offset(i, num_offsets)?;
             let (key, record) = self.index_block.decode_entry(entry_offset)?;
-            
+
             let block_start = match record {
-                Record::Put(val) => u64::from_be_bytes(
-                    val.try_into()
-                       .map_err(|_| ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string()))?
-                ),
-                Record::Delete => return Err(ReaderError::CorruptData("Index block contains Delete record".to_string())),
+                Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
+                    ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string())
+                })?),
+                Record::Delete => {
+                    return Err(ReaderError::CorruptData(
+                        "Index block contains Delete record".to_string(),
+                    ));
+                }
             };
 
             let next_block_offset = if i + 1 < num_offsets {
                 let next_entry_offset = self.index_block.get_offset(i + 1, num_offsets)?;
                 let (_, next_record) = self.index_block.decode_entry(next_entry_offset)?;
-                
+
                 match next_record {
-                    Record::Put(val) => u64::from_be_bytes(
-                        val.try_into()
-                           .map_err(|_| ReaderError::CorruptData("Next index pointer is not 8 bytes".to_string()))?
-                    ),
-                    Record::Delete => return Err(ReaderError::CorruptData("Next index contains Delete".to_string())),
+                    Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
+                        ReaderError::CorruptData("Next index pointer is not 8 bytes".to_string())
+                    })?),
+                    Record::Delete => {
+                        return Err(ReaderError::CorruptData(
+                            "Next index contains Delete".to_string(),
+                        ));
+                    }
                 }
             } else {
                 self.index_offset
@@ -128,7 +142,7 @@ impl SsTableReader {
                 if first_equal.is_none() {
                     first_equal = Some((block_start, next_block_offset));
                 }
-                // Once we find the first block starting with the target, we don't need to look 
+                // Once we find the first block starting with the target, we don't need to look
                 // further. Subsequent blocks will only contain older versions.
                 break;
             } else {
@@ -149,13 +163,13 @@ impl SsTableReader {
         // 2. Read the candidate blocks from disk and search them in order
         for (start_offset, next_offset) in candidate_blocks {
             let block_size = next_offset - start_offset;
-            
+
             self.file.seek(SeekFrom::Start(start_offset))?;
             let mut block_data = vec![0u8; block_size as usize];
             self.file.read_exact(&mut block_data)?;
-            
+
             let data_block = Block::decode(block_data);
-            
+
             // If we find the key in the first candidate (which contains the highest seq numbers),
             // we return it immediately and skip reading the second block.
             if let Some(result) = data_block.search(target_key)? {
@@ -401,40 +415,43 @@ mod tests {
     #[test]
     fn test_reader_search_multiple_versions_across_blocks() {
         let file = TempFileGuard::new("read_mvcc_multi_block.sst");
-        
+
         let mut entries = Vec::new();
-        
+
         // We use a 2000-byte padding so that each "banana" takes up ~half a block.
         // This guarantees that the 3 versions of banana span across at least 2 block boundaries.
-        let pad = vec![0u8; 2000]; 
-        
+        let pad = vec![0u8; 2000];
+
         entries.push(("apple".to_string(), Record::Put(b("red")), 1));
-        
+
         // NEWEST version: Should end up in the same block as "apple" or start its own
-        entries.push(("banana".to_string(), Record::Put(pad.clone()), 3)); 
-        
+        entries.push(("banana".to_string(), Record::Put(pad.clone()), 3));
+
         // MIDDLE version: Will overflow into a new block
         entries.push(("banana".to_string(), Record::Put(pad.clone()), 2));
-        
+
         // OLDEST version: Will overflow into yet another block
-        entries.push(("banana".to_string(), Record::Put(pad.clone()), 1)); 
-        
+        entries.push(("banana".to_string(), Record::Put(pad.clone()), 1));
+
         entries.push(("cherry".to_string(), Record::Put(b("red")), 1));
-        
+
         build_test_sst(file.path_str(), entries);
 
         let mut reader = SsTableReader::open(file.path_str()).unwrap();
 
         // When we search for "banana", the reader must correctly identify the block
         // containing sequence number 3 and return it, ignoring 2 and 1.
-        let (k, r) = reader.search("banana").unwrap().expect("banana should exist");
-        
+        let (k, r) = reader
+            .search("banana")
+            .unwrap()
+            .expect("banana should exist");
+
         assert_eq!(k.user_key, "banana");
         assert_eq!(
-            k.seq_num, 3, 
+            k.seq_num, 3,
             "Failed to retrieve the newest version! Reader index routing might be flawed."
         );
-        
+
         if let Record::Put(val) = r {
             assert_eq!(val.len(), 2000);
         } else {
@@ -445,46 +462,65 @@ mod tests {
     #[test]
     fn test_reader_search_large_record_spanning_multiple_blocks() {
         let file = TempFileGuard::new("read_large_record.sst");
-        
+
         // Create a 10KB value, which is significantly larger than a standard 4KB block
         let large_val_size = 10 * 1024;
         let mut large_val = vec![0u8; large_val_size];
-        
+
         // Fill it with a predictable pattern to verify data integrity later
         for i in 0..large_val_size {
             large_val[i] = (i % 256) as u8;
         }
 
         // Build an SSTable with the large record sandwiched between two normal records
-        build_test_sst(file.path_str(), vec![
-            ("a_small".to_string(), Record::Put(b("tiny")), 3),
-            ("b_large".to_string(), Record::Put(large_val.clone()), 2),
-            ("c_small".to_string(), Record::Put(b("tiny_again")), 1),
-        ]);
+        build_test_sst(
+            file.path_str(),
+            vec![
+                ("a_small".to_string(), Record::Put(b("tiny")), 3),
+                ("b_large".to_string(), Record::Put(large_val.clone()), 2),
+                ("c_small".to_string(), Record::Put(b("tiny_again")), 1),
+            ],
+        );
 
         let mut reader = SsTableReader::open(file.path_str()).unwrap();
 
         // 1. Retrieve and verify the massive record
-        let (k, r) = reader.search("b_large").unwrap().expect("large key should exist");
-        
+        let (k, r) = reader
+            .search("b_large")
+            .unwrap()
+            .expect("large key should exist");
+
         assert_eq!(k.user_key, "b_large");
         assert_eq!(k.seq_num, 2);
-        
+
         if let Record::Put(val) = r {
-            assert_eq!(val.len(), large_val_size, "The retrieved value should be exactly 10KB");
+            assert_eq!(
+                val.len(),
+                large_val_size,
+                "The retrieved value should be exactly 10KB"
+            );
             // Check that the data wasn't corrupted or truncated across block boundaries
-            assert_eq!(val, large_val, "The retrieved data pattern should perfectly match");
+            assert_eq!(
+                val, large_val,
+                "The retrieved data pattern should perfectly match"
+            );
         } else {
             panic!("Expected Put record for b_large");
         }
 
         // 2. Verify the key located AFTER the massive block is still indexed and readable
-        let (k2, r2) = reader.search("c_small").unwrap().expect("small key after large should exist");
+        let (k2, r2) = reader
+            .search("c_small")
+            .unwrap()
+            .expect("small key after large should exist");
         assert_eq!(k2.user_key, "c_small");
         assert!(matches!(r2, Record::Put(v) if v == b("tiny_again")));
-        
+
         // 3. Verify the key located BEFORE the massive block
-        let (k1, r1) = reader.search("a_small").unwrap().expect("small key before large should exist");
+        let (k1, r1) = reader
+            .search("a_small")
+            .unwrap()
+            .expect("small key before large should exist");
         assert_eq!(k1.user_key, "a_small");
         assert!(matches!(r1, Record::Put(v) if v == b("tiny")));
     }

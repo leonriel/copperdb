@@ -4,9 +4,7 @@ use std::io::Write;
 
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
-use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE,
-};
+use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE};
 
 #[derive(thiserror::Error, Debug)]
 pub enum WriterError {
@@ -17,6 +15,13 @@ pub enum WriterError {
     InvalidData(String),
 }
 
+/// Writes a sorted stream of key-record pairs to an on-disk SSTable file.
+///
+/// `build_from_iterator` consumes a `KvIterator` (typically from a frozen
+/// memtable), splits the entries into 4 KB data blocks, and appends an index
+/// block mapping each block's first key to its byte offset. The file is
+/// finalized with a footer containing the index block offset and a magic
+/// number for validation.
 pub struct SsTableBuilder {
     file: File,
     current_block: BlockBuilder,
@@ -417,11 +422,11 @@ mod tests {
     #[test]
     fn test_builder_oversized_block_creation() {
         let file = TempFileGuard::new("writer_oversized_block.sst");
-        
+
         // 1. Create a massive 10KB value, which far exceeds a standard 4KB block size limit.
         let large_val_size = 10 * 1024;
-        let large_val = vec![7u8; large_val_size]; 
-        
+        let large_val = vec![7u8; large_val_size];
+
         let entries = vec![
             ("a_small".to_string(), Record::Put(b("tiny").to_vec()), 3),
             ("b_massive".to_string(), Record::Put(large_val), 2),
@@ -430,24 +435,27 @@ mod tests {
 
         let iter = Box::new(MockIterator::new(entries));
         let mut builder = SsTableBuilder::new(file.path_str()).expect("Failed to create builder");
-        
+
         // 2. The builder should handle the oversized block gracefully without panicking
         // or throwing a chunking/buffer overflow error.
         let build_result = builder.build_from_iterator(iter);
-        assert!(build_result.is_ok(), "Builder failed to write the oversized block");
+        assert!(
+            build_result.is_ok(),
+            "Builder failed to write the oversized block"
+        );
 
         // 3. Verify the file was actually written to disk and has a sane size.
         // It must be at least as large as our 10KB payload, plus the index, footer, and other keys.
         let metadata = std::fs::metadata(file.path_str()).expect("Failed to read file metadata");
         let file_size = metadata.len();
-        
+
         assert!(
-            file_size > large_val_size as u64, 
-            "File size ({} bytes) is too small to contain the oversized block!", 
+            file_size > large_val_size as u64,
+            "File size ({} bytes) is too small to contain the oversized block!",
             file_size
         );
-        
-        // Optional: If you know your standard block size is 4096, the file should be 
+
+        // Optional: If you know your standard block size is 4096, the file should be
         // roughly: Block 1 (small) + Block 2 (10KB) + Block 3 (small) + Index + Footer.
         // It should comfortably be under 20KB.
         assert!(

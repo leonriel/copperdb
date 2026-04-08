@@ -3,9 +3,14 @@ use std::cmp;
 #[derive(thiserror::Error, Debug)]
 pub enum CoreError {
     #[error("Corrupt data: {0}")]
-    CorruptData(String)
+    CorruptData(String),
 }
 
+/// A user key paired with an MVCC sequence number.
+///
+/// Ordering sorts by `user_key` ascending, then by `seq_num` **descending**
+/// so that the newest version of a key always appears first in sorted
+/// structures (skip lists, SSTable blocks, iterators).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InternalKey {
     pub user_key: String,
@@ -27,6 +32,9 @@ impl PartialOrd for InternalKey {
     }
 }
 
+/// A universal iterator trait used across memtables, SSTable blocks, and the
+/// K-way merge process. Each call to `next` yields a user key, its record,
+/// and the associated sequence number.
 pub trait KvIterator: Send {
     /// Returns the next Key, Value, and Sequence Number
     fn next(&mut self) -> Option<(String, Record, u64)>;
@@ -58,6 +66,8 @@ impl TryFrom<u8> for RecordTag {
     }
 }
 
+/// The value half of a key-value entry. A `Put` carries the serialized
+/// value bytes; a `Delete` is a tombstone indicating the key was removed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Record {
     Put(Vec<u8>),

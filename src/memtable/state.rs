@@ -2,6 +2,11 @@ use std::sync::{Arc, RwLock};
 
 use crate::memtable::{CrossbeamMemTable, MemTable, QueryResult, Record};
 
+/// The immutable snapshot backing `MemTableState`'s copy-on-write scheme.
+///
+/// Holds a single active memtable that accepts writes and an ordered queue
+/// of frozen (immutable) memtables awaiting flush to disk. Cloned on every
+/// structural mutation so that concurrent readers see a consistent snapshot.
 #[derive(Clone)]
 struct InnerState {
     active: Arc<CrossbeamMemTable>,
@@ -9,7 +14,13 @@ struct InnerState {
     max_immutable_tables: usize,
 }
 
-// Holds state for all memtables
+/// Thread-safe manager for the active and immutable memtable queue.
+///
+/// Uses an `RwLock<Arc<InnerState>>` copy-on-write pattern: reads take a
+/// cheap `Arc` clone with no contention, while structural mutations
+/// (freeze, drop) hold the write lock only long enough to swap in a new
+/// `Arc`. Writes to the active memtable are lock-free after cloning the
+/// `Arc`, so concurrent readers and writers never block each other.
 pub struct MemTableState {
     inner: RwLock<Arc<InnerState>>,
     max_memtable_size: usize,
@@ -20,7 +31,7 @@ impl MemTableState {
         let initial_state = InnerState {
             active: Arc::new(CrossbeamMemTable::new(initial_id)),
             immutable: Vec::new(),
-            max_immutable_tables
+            max_immutable_tables,
         };
         Self {
             inner: RwLock::new(Arc::new(initial_state)),
@@ -59,7 +70,7 @@ impl MemTableState {
 
         // 2. Write the data (lock-free!)
         active_table.put(key, record, seq_num);
-        
+
         // 3. Internal capacity check
         if active_table.approximate_size() >= self.max_memtable_size {
             Some(active_table.id())
@@ -79,10 +90,10 @@ impl MemTableState {
     pub fn freeze_active(&self, new_id: u64) {
         let mut guard = self.inner.write().unwrap();
         let mut new_state = (**guard).clone();
-        
+
         new_state.immutable.push(new_state.active.clone());
         new_state.active = Arc::new(CrossbeamMemTable::new(new_id));
-        
+
         *guard = Arc::new(new_state);
     }
 
@@ -96,9 +107,12 @@ impl MemTableState {
     /// Returns None if there are no immutable tables waiting to be flushed.
     pub fn get_oldest_immutable(&self) -> Option<Arc<CrossbeamMemTable>> {
         let guard = self.inner.read().unwrap();
-        
+
         // The oldest table is at the front of the vector (index 0)
-        guard.immutable.first().map(|table_arc| Arc::clone(table_arc))
+        guard
+            .immutable
+            .first()
+            .map(|table_arc| Arc::clone(table_arc))
     }
 
     /// Safely removes a specific MemTable from the immutable list using CoW.
@@ -109,13 +123,12 @@ impl MemTableState {
         // 1. Check if the oldest table is actually the one we just flushed
         if let Some(oldest) = guard.immutable.first() {
             if Arc::ptr_eq(oldest, table_to_drop) {
-                
                 // 2. The CoW Mutation
                 let mut new_state = (**guard).clone();
-                
+
                 // Remove the flushed table from the front of the queue
-                new_state.immutable.remove(0); 
-                
+                new_state.immutable.remove(0);
+
                 // 3. The Swap
                 *guard = Arc::new(new_state);
             }
@@ -147,9 +160,12 @@ mod tests {
     #[test]
     fn test_put_and_get_active_table() {
         let state = MemTableState::new(4, 1024, 1);
-        
+
         let flush_id = state.put("apple".to_string(), Record::Put(b("red")), 1);
-        assert!(flush_id.is_none(), "Should not require flush well under capacity");
+        assert!(
+            flush_id.is_none(),
+            "Should not require flush well under capacity"
+        );
 
         let result = state.get("apple").unwrap();
         assert_eq!(result.0, Record::Put(b("red")));
@@ -160,7 +176,7 @@ mod tests {
     fn test_put_signals_capacity_limit() {
         // Set a tiny capacity: 50 bytes
         let state = MemTableState::new(4, 50, 1);
-        
+
         // Write #1: "apple" (5) + "red" (3) + seq (8) = 16 bytes. (Under capacity)
         let flush1 = state.put("apple".to_string(), Record::Put(b("red")), 1);
         assert!(flush1.is_none());
@@ -171,9 +187,13 @@ mod tests {
 
         // Write #3: "cherry" (6) + "red" (3) + seq (8) = 17 bytes. (Total 53, OVER capacity)
         let flush3 = state.put("cherry".to_string(), Record::Put(b("red")), 3);
-        
+
         // It should return Some(1), indicating MemTable 1 needs freezing
-        assert_eq!(flush3, Some(1), "Crossing the 50-byte threshold should return the active table's ID");
+        assert_eq!(
+            flush3,
+            Some(1),
+            "Crossing the 50-byte threshold should return the active table's ID"
+        );
 
         // The state no longer freezes itself! We explicitly orchestrate the rotation:
         if let Some(_) = flush3 {
@@ -182,18 +202,28 @@ mod tests {
 
         // Write #4: "date" (4) + "brown" (5) + seq (8) = 17 bytes. (New table, under capacity)
         let flush4 = state.put("date".to_string(), Record::Put(b("brown")), 4);
-        assert!(flush4.is_none(), "The new active table should be empty and not trigger a flush");
+        assert!(
+            flush4.is_none(),
+            "The new active table should be empty and not trigger a flush"
+        );
     }
 
     #[test]
     fn test_get_traverses_immutable_tables() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // Put in active
         state.put("old_key".to_string(), Record::Put(b("v1")), 1);
-        
+
         // Push it over the limit and freeze it explicitly
-        if state.put("filler".to_string(), Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")), 2).is_some() {
+        if state
+            .put(
+                "filler".to_string(),
+                Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")),
+                2,
+            )
+            .is_some()
+        {
             state.freeze_active(2);
         }
 
@@ -208,12 +238,19 @@ mod tests {
     #[test]
     fn test_get_returns_newest_version_across_tables() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // Version 1 goes into the first table
         state.put("apple".to_string(), Record::Put(b("green")), 1);
-        
+
         // Force a freeze
-        if state.put("filler".to_string(), Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")), 2).is_some() {
+        if state
+            .put(
+                "filler".to_string(),
+                Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")),
+                2,
+            )
+            .is_some()
+        {
             state.freeze_active(2);
         }
 
@@ -229,10 +266,17 @@ mod tests {
     #[test]
     fn test_get_returns_tombstone_masking_immutable_data() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // Insert value, force freeze
         state.put("apple".to_string(), Record::Put(b("red")), 1);
-        if state.put("filler".to_string(), Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")), 2).is_some() {
+        if state
+            .put(
+                "filler".to_string(),
+                Record::Put(b("data_that_takes_up_lots_of_space_to_force_freeze")),
+                2,
+            )
+            .is_some()
+        {
             state.freeze_active(2);
         }
 
@@ -293,7 +337,7 @@ mod tests {
         let state_reader = Arc::clone(&state);
         let reader_handle = thread::spawn(move || {
             for _ in 0..500 {
-                // The reader should never panic or deadlock while getting data, 
+                // The reader should never panic or deadlock while getting data,
                 // thanks to the RwLock + Arc Copy-on-Write pattern.
                 let result = state_reader.get("shared_key");
                 assert!(result.is_some());
@@ -302,14 +346,14 @@ mod tests {
 
         writer_handle.join().unwrap();
         reader_handle.join().unwrap();
-        
+
         let final_result = state.get("shared_key").unwrap();
         assert_eq!(final_result.1, 500);
     }
 
     #[test]
     fn test_capacity_signal_triggers_multiple_times_under_contention() {
-        // We set capacity to 1000 bytes. 
+        // We set capacity to 1000 bytes.
         // 10 threads will each write 200 bytes simultaneously (Total ~2000).
         let state = Arc::new(MemTableState::new(4, 1000, 1));
         let mut handles = vec![];
@@ -318,9 +362,9 @@ mod tests {
             let state_clone = Arc::clone(&state);
             handles.push(thread::spawn(move || {
                 // A large 200 byte value
-                let large_val = vec![0u8; 200]; 
+                let large_val = vec![0u8; 200];
                 let key = format!("key_{}", i);
-                
+
                 // Returns true if THIS write pushed the table over the threshold (Option is Some)
                 state_clone.put(key, Record::Put(large_val), 1).is_some()
             }));
@@ -344,11 +388,11 @@ mod tests {
     #[test]
     fn test_state_snapshot_isolation_during_freeze() {
         let state = Arc::new(MemTableState::new(4, 50, 1));
-        
+
         // Insert initial data
         state.put("keep_me".to_string(), Record::Put(b("v1")), 1);
 
-        // Manually simulate a reader grabbing the inner state directly 
+        // Manually simulate a reader grabbing the inner state directly
         // (This tests the CoW architecture's memory safety guarantees)
         let snapshot = {
             // Requires access to inner state via read lock (assuming accessible in tests)
@@ -359,7 +403,10 @@ mod tests {
         // Writer thread forces a freeze and pushes the state way past the old limits
         let state_writer = Arc::clone(&state);
         let writer = thread::spawn(move || {
-            if state_writer.put("force_freeze_1".to_string(), Record::Put(vec![0; 100]), 2).is_some() {
+            if state_writer
+                .put("force_freeze_1".to_string(), Record::Put(vec![0; 100]), 2)
+                .is_some()
+            {
                 state_writer.freeze_active(2);
             }
             state_writer.put("force_freeze_2".to_string(), Record::Put(vec![0; 100]), 3);
@@ -371,17 +418,24 @@ mod tests {
         // The reader's snapshot should STILL point to the original memory layout.
         // It should have 1 active table (which was never frozen from the snapshot's perspective)
         // and 0 immutable tables.
-        assert_eq!(snapshot.immutable.len(), 0, "Snapshot should be completely isolated from the writer's freeze");
-        
+        assert_eq!(
+            snapshot.immutable.len(),
+            0,
+            "Snapshot should be completely isolated from the writer's freeze"
+        );
+
         // The global state, however, should have moved that active table to immutables
         let global_state = state.inner.read().unwrap();
-        assert!(global_state.immutable.len() >= 1, "Global state should reflect the freeze");
+        assert!(
+            global_state.immutable.len() >= 1,
+            "Global state should reflect the freeze"
+        );
     }
 
     #[test]
     fn test_get_oldest_immutable_empty_state() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // If there are no frozen tables, it should safely return None
         assert!(state.get_oldest_immutable().is_none());
     }
@@ -389,14 +443,18 @@ mod tests {
     #[test]
     fn test_get_and_drop_oldest_immutable_standard_flow() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // 1. Force a freeze by inserting a large record
-        if state.put("big_key".to_string(), Record::Put(vec![0; 100]), 1).is_some() {
+        if state
+            .put("big_key".to_string(), Record::Put(vec![0; 100]), 1)
+            .is_some()
+        {
             state.freeze_active(2);
         }
 
         // 2. Flusher wakes up and gets the oldest immutable table
-        let table_to_flush = state.get_oldest_immutable()
+        let table_to_flush = state
+            .get_oldest_immutable()
             .expect("Should have one immutable table");
 
         // Internally verify the vector has 1 element
@@ -413,12 +471,18 @@ mod tests {
     #[test]
     fn test_drop_immutable_double_checked_locking_safety() {
         let state = MemTableState::new(4, 50, 1);
-        
+
         // Force TWO freezes to create a queue of immutable tables
-        if state.put("key_1".to_string(), Record::Put(vec![0; 100]), 1).is_some() {
+        if state
+            .put("key_1".to_string(), Record::Put(vec![0; 100]), 1)
+            .is_some()
+        {
             state.freeze_active(2);
         }
-        if state.put("key_2".to_string(), Record::Put(vec![0; 100]), 2).is_some() {
+        if state
+            .put("key_2".to_string(), Record::Put(vec![0; 100]), 2)
+            .is_some()
+        {
             state.freeze_active(3);
         }
 
@@ -427,15 +491,15 @@ mod tests {
         // Flusher grabs the oldest one
         let oldest_table = state.get_oldest_immutable().unwrap();
 
-        // SIMULATE A MISTAKE OR ROGUE THREAD: 
+        // SIMULATE A MISTAKE OR ROGUE THREAD:
         // Create an entirely unrelated table (with ID 99) that is NOT in the list
         let random_table = Arc::new(CrossbeamMemTable::new(99));
         state.drop_immutable(&random_table);
 
         // VALIDATION 1: The state should ignore the drop because `ptr_eq` failed
         assert_eq!(
-            state.inner.read().unwrap().immutable.len(), 
-            2, 
+            state.inner.read().unwrap().immutable.len(),
+            2,
             "State dropped a table it shouldn't have!"
         );
 
@@ -449,23 +513,29 @@ mod tests {
     #[test]
     fn test_concurrent_idempotent_drops() {
         let state = Arc::new(MemTableState::new(4, 50, 1));
-        
-        if state.put("key_1".to_string(), Record::Put(vec![0; 100]), 1).is_some() {
+
+        if state
+            .put("key_1".to_string(), Record::Put(vec![0; 100]), 1)
+            .is_some()
+        {
             state.freeze_active(2);
-        } 
-        if state.put("key_2".to_string(), Record::Put(vec![0; 100]), 2).is_some() {
+        }
+        if state
+            .put("key_2".to_string(), Record::Put(vec![0; 100]), 2)
+            .is_some()
+        {
             state.freeze_active(3);
         }
 
         let table_to_drop = state.get_oldest_immutable().unwrap();
-        
+
         let mut handles = vec![];
 
         // Spawn 10 threads that all try to drop the exact same table simultaneously
         for _ in 0..10 {
             let state_clone = Arc::clone(&state);
             let table_clone = Arc::clone(&table_to_drop);
-            
+
             handles.push(thread::spawn(move || {
                 state_clone.drop_immutable(&table_clone);
             }));
@@ -476,12 +546,12 @@ mod tests {
         }
 
         // VALIDATION: Because `drop_immutable` uses `Arc::ptr_eq` against the front
-        // of the vector, only the FIRST thread to acquire the lock will succeed. 
-        // The other 9 threads will see that the table at index 0 is no longer the 
+        // of the vector, only the FIRST thread to acquire the lock will succeed.
+        // The other 9 threads will see that the table at index 0 is no longer the
         // one they are trying to drop, and will safely do nothing.
         assert_eq!(
-            state.inner.read().unwrap().immutable.len(), 
-            1, 
+            state.inner.read().unwrap().immutable.len(),
+            1,
             "Concurrent drops caused too many tables to be removed!"
         );
     }

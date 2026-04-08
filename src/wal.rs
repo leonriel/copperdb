@@ -119,7 +119,12 @@ impl<C: Checksum> Wal<C> {
         let val_len = value.len() as u32;
 
         let mut payload = Vec::with_capacity(
-            size_of::<u64>() + size_of::<u8>() + size_of::<u32>() + key.len() + size_of::<u32>() + value.len(),
+            size_of::<u64>()
+                + size_of::<u8>()
+                + size_of::<u32>()
+                + key.len()
+                + size_of::<u32>()
+                + value.len(),
         );
         payload.extend_from_slice(&seq_num.to_be_bytes());
         payload.push(op_type);
@@ -204,7 +209,12 @@ pub fn replay<C: Checksum>(path: &Path) -> io::Result<Vec<WalRecord>> {
             Err(_) => break,
         };
 
-        records.push(WalRecord { seq_num, op, key, value: val_buf });
+        records.push(WalRecord {
+            seq_num,
+            op,
+            key,
+            value: val_buf,
+        });
     }
 
     Ok(records)
@@ -249,7 +259,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("copperdb_test_{}_{}", std::process::id(), id));
+        let path =
+            std::env::temp_dir().join(format!("copperdb_test_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&path).unwrap();
         path
     }

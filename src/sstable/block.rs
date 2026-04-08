@@ -36,17 +36,24 @@ impl From<std::str::Utf8Error> for BlockError {
 impl From<CoreError> for BlockError {
     fn from(err: CoreError) -> Self {
         match err {
-            CoreError::CorruptData(msg) => BlockError::CorruptData(msg)
+            CoreError::CorruptData(msg) => BlockError::CorruptData(msg),
         }
     }
 }
 
+/// Incrementally serializes key-record pairs into a single block.
+///
+/// Entries are appended in sorted order. The builder tracks the estimated
+/// size and rejects new entries (returning `false` from `add`) once the
+/// block would exceed `TARGET_BLOCK_SIZE` (4 KB). Calling `build` finalizes
+/// the block by appending the offset array and entry count footer.
 pub struct BlockBuilder {
     data: Vec<u8>,
     offsets: Vec<Offset>,
 }
 
 impl BlockBuilder {
+    /// Creates a new, empty `BlockBuilder` ready to accept entries.
     pub fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -54,6 +61,11 @@ impl BlockBuilder {
         }
     }
 
+    /// Serializes and appends a key-record pair to the block.
+    ///
+    /// Returns `true` if the entry was added, or `false` if adding it would
+    /// exceed `TARGET_BLOCK_SIZE`. The first entry is always accepted
+    /// regardless of size.
     pub fn add(&mut self, key: &InternalKey, record: &Record) -> bool {
         let key_bytes = key.user_key.as_bytes();
         let key_len = key_bytes.len() as KeyLen;
@@ -91,10 +103,15 @@ impl BlockBuilder {
         true
     }
 
+    /// Returns `true` if no entries have been added to the builder yet.
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
+    /// Consumes the builder and produces the final block bytes.
+    ///
+    /// Appends the offset array and entry count footer after the serialized
+    /// entry data, yielding a complete block ready to be written to disk.
     pub fn build(mut self) -> Vec<u8> {
         for offset in &self.offsets {
             self.data.extend_from_slice(&offset.to_be_bytes());
@@ -107,17 +124,26 @@ impl BlockBuilder {
     }
 }
 
+/// A read-only view over a serialized block of key-record entries.
+///
+/// The binary layout is: serialized entries, followed by an array of `Offset`
+/// values pointing to each entry, followed by a `u16` entry count footer.
+/// Supports random access via `decode_entry` and binary search via `search`.
 pub struct Block {
     data: Vec<u8>,
 }
 
 impl Block {
+    /// Wraps raw bytes into a `Block` for reading. No validation is performed
+    /// at construction time; errors surface when entries are accessed.
     pub fn decode(data: Vec<u8>) -> Self {
         Self { data }
     }
 
     // --- Helper Methods ---
 
+    /// Reads the entry count from the block footer. Returns `0` if the block
+    /// is too small to contain a valid footer.
     pub fn get_num_offsets(&self) -> Result<usize, BlockError> {
         if self.data.len() < OFFSET_SIZE {
             return Ok(0);
@@ -129,6 +155,8 @@ impl Block {
         Ok(Offset::from_be_bytes(bytes) as usize)
     }
 
+    /// Returns the byte offset of the `index`-th entry within the block's
+    /// data section. `num_offsets` must match the value from `get_num_offsets`.
     pub fn get_offset(&self, index: usize, num_offsets: usize) -> Result<usize, BlockError> {
         let offsets_total_size = num_offsets * OFFSET_SIZE;
         if self.data.len() < OFFSET_SIZE + offsets_total_size {
@@ -149,6 +177,9 @@ impl Block {
         Ok(Offset::from_be_bytes(bytes) as usize)
     }
 
+    /// Reads only the user key string at the given byte offset without
+    /// parsing the rest of the entry. Used by binary search to compare keys
+    /// cheaply.
     fn peek_user_key(&self, offset: usize) -> Result<&str, BlockError> {
         if offset + KEY_LEN_SIZE > self.data.len() {
             return Err(BlockError::CorruptData(
@@ -171,6 +202,9 @@ impl Block {
         Ok(key_str)
     }
 
+    /// Fully deserializes the entry at the given byte offset, returning
+    /// the `InternalKey` (user key + sequence number) and the `Record`
+    /// (either a `Put` with its value or a `Delete` tombstone).
     pub fn decode_entry(&self, offset: usize) -> Result<(InternalKey, Record), BlockError> {
         // Parse User Key length
         if offset + KEY_LEN_SIZE > self.data.len() {
@@ -238,6 +272,9 @@ impl Block {
 
     // --- The Core Search ---
 
+    /// Binary-searches the block for `target_key` and returns the newest
+    /// version (highest sequence number) if found. Returns `Ok(None)` if the
+    /// key is not present in this block.
     pub fn search(&self, target_key: &str) -> Result<Option<(InternalKey, Record)>, BlockError> {
         let num_offsets = self.get_num_offsets()?;
         if num_offsets == 0 {

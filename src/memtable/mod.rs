@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_skiplist::SkipMap;
 use std::ops::Bound;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::core::{InternalKey, Record, KvIterator};
+use crate::core::{InternalKey, KvIterator, Record};
 
 pub mod state;
 
@@ -13,7 +13,9 @@ pub type QueryResult = Option<(Record, u64)>;
 /// The interface for our concurrent in-memory write buffer.
 /// Requires Send + Sync so it can be safely shared across Tokio threads.
 pub trait MemTable: Send + Sync {
+    /// Creates a new MemTable with an ID.
     fn new(id: u64) -> Self;
+
     /// Inserts a new record or tombstone.
     /// Uses a sequence number to handle versioning and conflict resolution.
     fn put(&self, key: String, record: Record, seq_num: u64);
@@ -34,13 +36,18 @@ pub trait MemTable: Send + Sync {
     fn id(&self) -> u64;
 }
 
+/// A lock-free, concurrent memtable backed by a `crossbeam_skiplist::SkipMap`.
+///
+/// Supports concurrent reads and writes from multiple threads. An atomic
+/// `active_writers` counter lets the flush worker spin-wait until all
+/// in-flight writes have completed before iterating the frozen table.
 pub struct CrossbeamMemTable {
     // We wrap the map in an Arc so our iterators can safely hold a reference
     // to it without introducing complex lifetime parameters to our traits.
     map: Arc<SkipMap<InternalKey, Record>>,
     approximate_size: AtomicUsize,
     active_writers: AtomicUsize,
-    id: u64
+    id: u64,
 }
 
 impl MemTable for CrossbeamMemTable {
@@ -49,11 +56,11 @@ impl MemTable for CrossbeamMemTable {
             map: Arc::new(SkipMap::new()),
             approximate_size: AtomicUsize::new(0), // Used to determine whether to mark table as inactive
 
-             // Flush worker checks that this is 0 before writing to disk
-             // Potentially use a spin_loop() while waiting for active_writers
-             // to drop to 0
+            // Flush worker checks that this is 0 before writing to disk
+            // Potentially use a spin_loop() while waiting for active_writers
+            // to drop to 0
             active_writers: AtomicUsize::new(0),
-            id
+            id,
         }
     }
 
@@ -77,7 +84,8 @@ impl MemTable for CrossbeamMemTable {
         self.map.insert(internal_key, record);
 
         // Atomically add the byte size (plus 8 bytes for the u64 seq_num)
-        self.approximate_size.fetch_add(key_len + val_len + 8, Ordering::SeqCst);
+        self.approximate_size
+            .fetch_add(key_len + val_len + 8, Ordering::SeqCst);
 
         // We are done writing. Decrement the counter.
         self.active_writers.fetch_sub(1, Ordering::SeqCst);
@@ -85,17 +93,17 @@ impl MemTable for CrossbeamMemTable {
 
     fn get(&self, target_key: &str) -> QueryResult {
         // 1. Create a dummy key with the absolute highest sequence number.
-        // Because of our custom Ord, this key will logically sit immediately 
+        // Because of our custom Ord, this key will logically sit immediately
         // BEFORE the newest actual version of "apple" in the SkipList.
         let search_key = InternalKey {
             user_key: target_key.to_string(),
-            seq_num: u64::MAX, 
+            seq_num: u64::MAX,
         };
 
         // 2. Ask Crossbeam for the first entry that is >= our dummy key
         let entry = self.map.lower_bound(Bound::Included(&search_key))?;
 
-        // 3. Check if we actually found our key, or if we accidentally 
+        // 3. Check if we actually found our key, or if we accidentally
         // skipped ahead to "banana" because "apple" doesn't exist.
         let found_key = entry.key();
         if found_key.user_key == target_key {
@@ -121,30 +129,50 @@ impl MemTable for CrossbeamMemTable {
     }
 }
 
+/// A stateful, forward-only iterator over a `CrossbeamMemTable`.
+///
+/// Yields **every version** of each key (newest first, by descending sequence
+/// number) within the requested range bounds — unlike `MemTable::get`, which
+/// returns only the newest version.
+///
+/// Because the underlying `SkipMap` is lock-free, concurrent writes are
+/// visible to the iterator if they are inserted at a position the iterator
+/// has not yet passed. Writes inserted behind the iterator's current
+/// position will not be seen.
 pub struct MemTableIterator {
     map: Arc<SkipMap<InternalKey, Record>>,
     // We now store the exact InternalKey to resume our search
-    next_key: Option<InternalKey>, 
+    next_key: Option<InternalKey>,
     high: Bound<String>,
     is_valid: bool,
 }
 
 impl MemTableIterator {
-    pub fn new(map: Arc<SkipMap<InternalKey, Record>>, low: Bound<String>, high: Bound<String>) -> Self {
+    pub fn new(
+        map: Arc<SkipMap<InternalKey, Record>>,
+        low: Bound<String>,
+        high: Bound<String>,
+    ) -> Self {
         // Determine the actual starting key based on the lower bound
         let next_key = match &low {
             Bound::Included(key) => {
                 // Start exactly at this key (or the newest version of it)
-                Some(InternalKey { user_key: key.clone(), seq_num: u64::MAX })
+                Some(InternalKey {
+                    user_key: key.clone(),
+                    seq_num: u64::MAX,
+                })
             }
             Bound::Excluded(key) => {
-                // For excluded, we still search for the key, but the .next() 
-                // logic will have to skip it. (Omitted here for brevity, 
+                // For excluded, we still search for the key, but the .next()
+                // logic will have to skip it. (Omitted here for brevity,
                 // but you'd handle it in the .next() method).
-                Some(InternalKey { user_key: key.clone(), seq_num: 0 }) 
+                Some(InternalKey {
+                    user_key: key.clone(),
+                    seq_num: 0,
+                })
             }
             Bound::Unbounded => {
-                // If there is no lower bound, just grab the very first 
+                // If there is no lower bound, just grab the very first
                 // entry in the entire SkipMap!
                 map.front().map(|entry| entry.key().clone())
             }
@@ -160,6 +188,14 @@ impl MemTableIterator {
 }
 
 impl KvIterator for MemTableIterator {
+    /// Advances the iterator and returns the next `(user_key, record, seq_num)`.
+    ///
+    /// Every version of a key is returned individually (not just the newest),
+    /// ordered by `user_key` ascending then `seq_num` descending. Returns
+    /// `None` when the iterator is exhausted or the upper bound is reached.
+    ///
+    /// Callers should check `is_valid()` before calling `next()` to avoid
+    /// unnecessary work on an already-exhausted iterator.
     fn next(&mut self) -> Option<(String, Record, u64)> {
         if !self.is_valid {
             return None;
@@ -204,8 +240,8 @@ impl KvIterator for MemTableIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     // --- Helper function for cleaner tests ---
@@ -268,11 +304,14 @@ mod tests {
         memtable.put("date".to_string(), Record::Put(b("4")), 4);
 
         // Iterator from [banana, date)
-        let mut iter = memtable.get_iterator(Bound::Included("banana".to_string()), Bound::Excluded("date".to_string()));
-        
+        let mut iter = memtable.get_iterator(
+            Bound::Included("banana".to_string()),
+            Bound::Excluded("date".to_string()),
+        );
+
         let first = iter.next().unwrap();
         assert_eq!(first.0, "banana");
-        
+
         let second = iter.next().unwrap();
         assert_eq!(second.0, "cherry");
 
@@ -289,12 +328,24 @@ mod tests {
         memtable.put("apple".to_string(), Record::Put(b("v3")), 30);
         memtable.put("apple".to_string(), Record::Put(b("v2")), 20);
 
-        let mut iter = memtable.get_iterator(Bound::Included("apple".to_string()), Bound::Excluded("b".to_string()));
+        let mut iter = memtable.get_iterator(
+            Bound::Included("apple".to_string()),
+            Bound::Excluded("b".to_string()),
+        );
 
         // Should yield highest seq_num first
-        assert_eq!(iter.next().unwrap(), ("apple".to_string(), Record::Put(b("v3")), 30));
-        assert_eq!(iter.next().unwrap(), ("apple".to_string(), Record::Put(b("v2")), 20));
-        assert_eq!(iter.next().unwrap(), ("apple".to_string(), Record::Put(b("v1")), 10));
+        assert_eq!(
+            iter.next().unwrap(),
+            ("apple".to_string(), Record::Put(b("v3")), 30)
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            ("apple".to_string(), Record::Put(b("v2")), 20)
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            ("apple".to_string(), Record::Put(b("v1")), 10)
+        );
         assert!(iter.next().is_none());
     }
 
@@ -374,7 +425,7 @@ mod tests {
     fn test_concurrent_reads_while_writing() {
         let memtable = Arc::new(CrossbeamMemTable::new(0));
         let mt_writer = Arc::clone(&memtable);
-        
+
         // Writer thread constantly adding new versions of "hot_key"
         let writer_handle = thread::spawn(move || {
             for seq in 1..=500 {
@@ -437,7 +488,7 @@ mod tests {
         }
 
         let mt_writer = Arc::clone(&memtable);
-        
+
         // 2. Spawn a thread to concurrently write "odd" keys and update "even" keys
         let writer_handle = thread::spawn(move || {
             // Insert entirely new keys
@@ -476,10 +527,13 @@ mod tests {
         for i in 1..yielded_records.len() {
             let prev = &yielded_records[i - 1];
             let curr = &yielded_records[i];
-            
+
             if prev.0 == curr.0 {
                 // If the user_key is the same (multiple versions), seq_num MUST be descending
-                assert!(prev.2 > curr.2, "Sequence numbers must be descending for the same key");
+                assert!(
+                    prev.2 > curr.2,
+                    "Sequence numbers must be descending for the same key"
+                );
             } else {
                 // Otherwise, the user_key MUST be strictly ascending alphabetically
                 assert!(prev.0 < curr.0, "Keys must be strictly ascending");
@@ -487,16 +541,16 @@ mod tests {
         }
 
         // B. We must have seen AT LEAST the initial 50 even keys.
-        // (They might be the seq=1 versions, or the seq=3 versions depending on thread timing, 
+        // (They might be the seq=1 versions, or the seq=3 versions depending on thread timing,
         // but the core user_key must not have been skipped).
         use std::collections::HashSet;
         let unique_keys: HashSet<_> = yielded_records.into_iter().map(|(k, _, _)| k).collect();
-        
+
         for i in (0..100).step_by(2) {
             let expected_key = format!("key_{:03}", i);
             assert!(
-                unique_keys.contains(&expected_key), 
-                "Iterator completely missed an initially inserted key: {}", 
+                unique_keys.contains(&expected_key),
+                "Iterator completely missed an initially inserted key: {}",
                 expected_key
             );
         }
@@ -506,7 +560,7 @@ mod tests {
     fn test_active_writers_returns_to_zero_after_heavy_contention() {
         let table = Arc::new(CrossbeamMemTable::new(0));
         let mut handles = vec![];
-        
+
         // Use a barrier to force all 10 threads to start at the exact same time,
         // maximizing the chance of active_writers going well above 1.
         let start_barrier = Arc::new(Barrier::new(10));
@@ -514,10 +568,10 @@ mod tests {
         for i in 0..10 {
             let table_clone = Arc::clone(&table);
             let barrier_clone = Arc::clone(&start_barrier);
-            
+
             handles.push(thread::spawn(move || {
                 barrier_clone.wait(); // Wait for all threads to be ready
-                
+
                 for j in 0..1000 {
                     let key = format!("key_{}_{}", i, j);
                     table_clone.put(key, Record::Put(b("val")), j);
@@ -533,8 +587,8 @@ mod tests {
         // VALIDATION: If any thread panicked or failed to decrement, this will fail.
         // It must be exactly 0 when no threads are writing.
         assert_eq!(
-            table.active_writers(), 
-            0, 
+            table.active_writers(),
+            0,
             "Active writers leaked! The counter did not return to 0."
         );
     }
@@ -543,7 +597,7 @@ mod tests {
     fn test_flusher_spin_loop_waits_for_in_flight_writers() {
         let table = Arc::new(CrossbeamMemTable::new(0));
         let table_for_writer = Arc::clone(&table);
-        
+
         // This flag simulates the MemTableState freezing the active table.
         // It tells the flusher: "No NEW writers are allowed, but existing ones might be finishing up."
         let is_frozen = Arc::new(AtomicBool::new(false));
@@ -554,7 +608,7 @@ mod tests {
                 let key = format!("key_{:04}", i);
                 table_for_writer.put(key, Record::Put(b("data")), i);
             }
-            
+
             // The writer announces that the table is now "frozen"
             is_frozen_writer.store(true, Ordering::SeqCst);
         });
@@ -566,27 +620,26 @@ mod tests {
                 std::hint::spin_loop();
             }
 
-            // 2. THE CRITICAL SECTION: The table is frozen, but in-flight writers 
-            // might still be inside the `.insert()` method. 
+            // 2. THE CRITICAL SECTION: The table is frozen, but in-flight writers
+            // might still be inside the `.insert()` method.
             // We use the spin loop to wait for the barrier to reach 0.
             while table.active_writers() > 0 {
                 std::hint::spin_loop(); // Yield the core's pipeline, but not the OS thread
             }
 
-            // 3. SAFE ZONE: active_writers is exactly 0. 
+            // 3. SAFE ZONE: active_writers is exactly 0.
             // We are guaranteed that the SkipMap has settled. We can now iterate.
             let mut record_count = 0;
             let mut iter = table.get_iterator(Bound::Unbounded, Bound::Unbounded);
-            
+
             while let Some(_) = iter.next() {
                 record_count += 1;
             }
 
-            // If the spin loop didn't work, the iterator would have started too early 
+            // If the spin loop didn't work, the iterator would have started too early
             // and missed keys that were still being inserted by the writer thread.
             assert_eq!(
-                record_count, 
-                5000, 
+                record_count, 5000,
                 "Flusher missed data! It did not wait for active_writers to hit 0."
             );
         });

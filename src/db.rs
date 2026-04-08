@@ -45,7 +45,7 @@ impl LsmEngine {
                 WalOpType::Put => Record::Put(r.value),
                 WalOpType::Delete => Record::Delete,
             };
-            // Ignore capacity limits during replay. All old WALs get merged 
+            // Ignore capacity limits during replay. All old WALs get merged
             // into this single starting MemTable.
             state.put(r.key, record, r.seq_num);
         }
@@ -113,25 +113,25 @@ impl LsmEngine {
     fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
         // 1. Lock the WAL. This acts as our synchronization barrier.
         let mut wal_guard = self.active_wal.lock().unwrap();
-        
+
         // 2. Identity-Based Double-Checked Locking!
-        // If the active table's ID no longer matches the ID of the table we 
+        // If the active table's ID no longer matches the ID of the table we
         // filled up, it means another thread already rotated it. Abort safely!
         if self.state.active_id() != expected_id {
             return Ok(());
         }
 
         let new_wal_gen = self.next_wal_gen.fetch_add(1, Ordering::SeqCst);
-        
+
         // 3. Create the new WAL file
         let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
-        
+
         // 4. Freeze the MemTable and assign it the EXACT SAME ID
         self.state.freeze_active(new_wal_gen);
-        
+
         // 5. Swap the active WAL
         *wal_guard = new_wal;
-        
+
         Ok(())
     }
 }
@@ -161,8 +161,7 @@ mod tests {
     fn tmp_dir() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir()
-            .join(format!("copperdb_db_{}_{}", std::process::id(), id));
+        let p = std::env::temp_dir().join(format!("copperdb_db_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
