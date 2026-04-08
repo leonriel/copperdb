@@ -1,7 +1,10 @@
+use bloomfilter::Bloom;
+
 use crate::core::{InternalKey, Record};
 use crate::sstable::block::{Block, BlockError};
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER, MAGIC_SIZE, META_OFFSET_SIZE,
+    MagicNumber,
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -30,7 +33,9 @@ pub enum ReaderError {
 pub struct SsTableReader {
     file: File,
     index_block: Block,
-    index_offset: IndexOffset,
+    /// Byte offset where the meta block begins (i.e. where data blocks end)
+    meta_offset: u64,
+    bloom: Bloom<String>,
 }
 
 impl SsTableReader {
@@ -54,12 +59,17 @@ impl SsTableReader {
         file.read_exact(&mut footer_buf)?;
 
         // Determine slice boundaries based on our constants
-        let index_end = INDEX_OFFSET_SIZE;
+        let meta_end = META_OFFSET_SIZE;
+        let index_end = meta_end + INDEX_OFFSET_SIZE;
         let magic_end = index_end + MAGIC_SIZE;
 
         // Safely attempt to convert the slices into 8-byte arrays
+        let meta_offset =
+            u64::from_be_bytes(footer_buf[0..meta_end].try_into().map_err(|_| {
+                ReaderError::CorruptData("Failed to parse meta offset from footer".to_string())
+            })?);
         let index_offset =
-            u64::from_be_bytes(footer_buf[0..index_end].try_into().map_err(|_| {
+            u64::from_be_bytes(footer_buf[meta_end..index_end].try_into().map_err(|_| {
                 ReaderError::CorruptData("Failed to parse index offset from footer".to_string())
             })?);
         let magic =
@@ -71,7 +81,16 @@ impl SsTableReader {
             return Err(ReaderError::InvalidMagicNumber(magic));
         }
 
-        // 2. Read and decode the Index Block
+        // 2. Read and deserialize the Meta Block (bloom filter)
+        let meta_size = index_offset - meta_offset;
+        file.seek(SeekFrom::Start(meta_offset))?;
+        let mut meta_data = vec![0u8; meta_size as usize];
+        file.read_exact(&mut meta_data)?;
+
+        let bloom = Bloom::from_bytes(meta_data)
+            .map_err(|e| ReaderError::CorruptData(format!("Invalid bloom filter: {}", e)))?;
+
+        // 3. Read and decode the Index Block
         let index_size = file_len - (FOOTER_SIZE as u64) - index_offset;
         file.seek(SeekFrom::Start(index_offset))?;
         let mut index_data = vec![0u8; index_size as usize];
@@ -82,7 +101,8 @@ impl SsTableReader {
         Ok(Self {
             file,
             index_block,
-            index_offset,
+            meta_offset,
+            bloom,
         })
     }
 
@@ -92,6 +112,11 @@ impl SsTableReader {
         &mut self,
         target_key: &str,
     ) -> Result<Option<(InternalKey, Record)>, ReaderError> {
+        // Fast path: if the bloom filter says the key is absent, skip disk reads
+        if !self.bloom.check(&target_key.to_string()) {
+            return Ok(None);
+        }
+
         let num_offsets = self.index_block.get_num_offsets()?;
 
         if num_offsets == 0 {
@@ -132,7 +157,7 @@ impl SsTableReader {
                     }
                 }
             } else {
-                self.index_offset
+                self.meta_offset
             };
 
             // Route to the correct candidate blocks
@@ -265,7 +290,7 @@ mod tests {
     fn test_reader_open_file_too_short() {
         let file = TempFileGuard::new("too_short.sst");
 
-        // Write a 10-byte file (smaller than our 16-byte FOOTER_SIZE)
+        // Write a 10-byte file (smaller than our FOOTER_SIZE)
         {
             let mut f = File::create(&file.path).unwrap();
             f.write_all(&[0u8; 10]).unwrap();
@@ -284,11 +309,13 @@ mod tests {
     fn test_reader_open_invalid_magic() {
         let file = TempFileGuard::new("bad_magic.sst");
 
-        // Write exactly 16 bytes, but with a bad magic number
+        // Write exactly FOOTER_SIZE bytes, but with a bad magic number
         {
             let mut f = File::create(&file.path).unwrap();
+            let meta_offset = 0u64.to_be_bytes();
             let index_offset = 0u64.to_be_bytes();
             let bad_magic = 0xBADBADBADBADBADBu64.to_be_bytes();
+            f.write_all(&meta_offset).unwrap();
             f.write_all(&index_offset).unwrap();
             f.write_all(&bad_magic).unwrap();
         }

@@ -2,7 +2,7 @@
 
 ## SSTable File
 
-An SSTable file is composed of three regions written sequentially:
+An SSTable file is composed of four regions written sequentially:
 
 ```
 +--------------------+
@@ -14,9 +14,11 @@ An SSTable file is composed of three regions written sequentially:
 +--------------------+
 |   Data Block N     |
 +--------------------+
+|   Meta Block       |
++--------------------+
 |   Index Block      |
 +--------------------+
-|   Footer (16 B)    |
+|   Footer (24 B)    |
 +--------------------+
 ```
 
@@ -31,6 +33,19 @@ oversized block.
 Entries are written in the same order they arrive from the memtable iterator:
 `user_key` ascending, then `seq_num` descending (newest version first).
 
+### Meta Block (Bloom Filter)
+
+The meta block contains a serialized bloom filter (via `bloomfilter::Bloom::to_bytes()`)
+that tracks every `user_key` written to the SSTable. On read, the bloom filter
+is loaded into memory by `SsTableReader::open` and checked before any data
+block I/O in `search`. If the bloom filter reports that a key is absent, the
+search short-circuits with `None`, avoiding disk reads entirely.
+
+The bloom filter is configured with a 1% false-positive rate and sized for an
+estimated 10,000 keys per SSTable. Under these parameters the bitmap is
+11,982 bytes plus a 44-byte crate header, totalling approximately 12 KB per
+SSTable.
+
 ### Index Block
 
 The index block has the same binary format as a data block (see below), but
@@ -44,12 +59,13 @@ file. Each index entry is:
 The index block is currently limited to a single block. If the index exceeds
 `TARGET_BLOCK_SIZE`, the writer returns an error.
 
-### Footer (16 bytes)
+### Footer (24 bytes)
 
-| Field         | Type        | Size    | Description                          |
-|---------------|-------------|---------|--------------------------------------|
+| Field         | Type        | Size    | Description                              |
+|---------------|-------------|---------|------------------------------------------|
+| Meta Offset   | `u64` (BE)  | 8 bytes | Byte offset where the meta block starts  |
 | Index Offset  | `u64` (BE)  | 8 bytes | Byte offset where the index block starts |
-| Magic Number  | `u64` (BE)  | 8 bytes | `0xDEADBEEFCAFEBABE` for validation  |
+| Magic Number  | `u64` (BE)  | 8 bytes | `0xDEADBEEFCAFEBABE` for validation      |
 
 ---
 
@@ -67,10 +83,10 @@ All blocks (data and index) share the same binary format:
 +---------------------------+
 |   Entry N                 |
 +---------------------------+
-|   Offset 0   (u16 BE)    |
-|   Offset 1   (u16 BE)    |
+|   Offset 0   (u16 BE)     |
+|   Offset 1   (u16 BE)     |
 |       ...                 |
-|   Offset N   (u16 BE)    |
+|   Offset N   (u16 BE)     |
 +---------------------------+
 |   Num Offsets (u16 BE)    |
 +---------------------------+

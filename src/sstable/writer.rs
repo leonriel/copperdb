@@ -2,9 +2,13 @@
 use std::fs::File;
 use std::io::Write;
 
+use bloomfilter::Bloom;
+
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
-use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE};
+use crate::sstable::{
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, META_OFFSET_SIZE,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum WriterError {
@@ -14,6 +18,15 @@ pub enum WriterError {
     #[error("Invalid data: {0}")]
     InvalidData(String),
 }
+
+
+/// The default false-positive rate for the bloom filter (1%).
+const BLOOM_FP_RATE: f64 = 0.01;
+
+/// The estimated number of unique keys per SSTable, used to size the bloom
+/// filter. Overestimating wastes a small amount of memory; underestimating
+/// raises the false-positive rate.
+const BLOOM_ESTIMATED_ITEMS: u32 = 10_000;
 
 /// Writes a sorted stream of key-record pairs to an on-disk SSTable file.
 ///
@@ -30,17 +43,22 @@ pub struct SsTableBuilder {
     current_offset: IndexOffset,
     /// Tracks the first user_key added to the current block
     first_key_of_current_block: Option<String>,
+    /// Bloom filter tracking every unique user_key added to this SSTable
+    bloom: Bloom<String>,
 }
 
 impl SsTableBuilder {
     pub fn new(path: &str) -> Result<Self, WriterError> {
         let file = File::create(path)?;
+        let bloom = Bloom::new_for_fp_rate(BLOOM_ESTIMATED_ITEMS as usize, BLOOM_FP_RATE)
+            .map_err(|e| WriterError::InvalidData(e.to_string()))?;
         Ok(Self {
             file,
             current_block: BlockBuilder::new(),
             block_index: Vec::new(),
             current_offset: 0,
             first_key_of_current_block: None,
+            bloom,
         })
     }
 
@@ -70,6 +88,9 @@ impl SsTableBuilder {
                 }
             }
 
+            // Track every user_key in the bloom filter
+            self.bloom.set(&user_key);
+
             // If this is the first entry in a block, save it for the index
             if self.first_key_of_current_block.is_none() {
                 self.first_key_of_current_block = Some(user_key);
@@ -80,6 +101,12 @@ impl SsTableBuilder {
         if !self.current_block.is_empty() {
             self.finish_current_block()?;
         }
+
+        // Write the Meta Block (serialized bloom filter)
+        let meta_offset = self.current_offset;
+        let meta_data = self.bloom.to_bytes();
+        self.file.write_all(&meta_data)?;
+        self.current_offset += meta_data.len() as u64;
 
         // Build the Index Block
         let mut index_block = BlockBuilder::new();
@@ -105,12 +132,14 @@ impl SsTableBuilder {
         self.file.write_all(&index_data)?;
         self.current_offset += index_data.len() as u64;
 
-        // Write a fixed-size Footer (16 bytes)
+        // Write a fixed-size Footer (24 bytes)
         let mut footer = [0u8; FOOTER_SIZE];
-        let index_end = INDEX_OFFSET_SIZE;
+        let meta_end = META_OFFSET_SIZE;
+        let index_end = meta_end + INDEX_OFFSET_SIZE;
         let magic_end = index_end + MAGIC_SIZE;
 
-        footer[0..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[0..meta_end].copy_from_slice(&meta_offset.to_be_bytes());
+        footer[meta_end..index_end].copy_from_slice(&index_offset.to_be_bytes());
         footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
 
         self.file.write_all(&footer)?;
@@ -223,6 +252,26 @@ mod tests {
         str.as_bytes().to_vec()
     }
 
+    /// Parses the footer from raw SSTable bytes, returning (meta_offset, index_offset).
+    fn parse_footer(data: &[u8]) -> (usize, usize) {
+        let len = data.len();
+        let footer_start = len - FOOTER_SIZE;
+
+        let meta_offset = u64::from_be_bytes(
+            data[footer_start..footer_start + META_OFFSET_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        let index_offset = u64::from_be_bytes(
+            data[footer_start + META_OFFSET_SIZE..footer_start + META_OFFSET_SIZE + INDEX_OFFSET_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        (meta_offset, index_offset)
+    }
+
     // =========================================================================
     // SsTableBuilder Tests (4 Tests)
     // =========================================================================
@@ -254,21 +303,21 @@ mod tests {
         // Verify File Contents
         let data = fs::read(&file.path).unwrap();
 
-        // Even empty, it should have an empty Index Block + 16 byte Footer
+        // Even empty, it should have a Meta Block + empty Index Block + Footer
         assert!(data.len() >= FOOTER_SIZE);
 
         let len = data.len();
-        let magic = u64::from_be_bytes(data[len - 8..len].try_into().unwrap());
+        let magic_start = len - MAGIC_SIZE;
+        let magic = u64::from_be_bytes(data[magic_start..len].try_into().unwrap());
         assert_eq!(
             magic, 0xDEADBEEFCAFEBABEu64,
             "Footer magic number is missing/corrupted"
         );
 
-        let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+        let (meta_offset, index_offset) = parse_footer(&data);
         assert_eq!(
-            index_offset, 0,
-            "Since there are no data blocks, index offset should be 0"
+            meta_offset, 0,
+            "Since there are no data blocks, meta offset should be 0"
         );
 
         // Decode the index block
@@ -300,8 +349,7 @@ mod tests {
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
 
-        let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+        let (meta_offset, index_offset) = parse_footer(&data);
 
         // 1. Verify Index Block
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
@@ -330,8 +378,8 @@ mod tests {
             "The first data block should start at byte 0"
         );
 
-        // 2. Verify Data Block
-        let data_block_bytes = data[0..index_offset].to_vec();
+        // 2. Verify Data Block (data blocks end where the meta block begins)
+        let data_block_bytes = data[0..meta_offset].to_vec();
         let data_block = Block::decode(data_block_bytes);
 
         assert_eq!(
@@ -366,8 +414,7 @@ mod tests {
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
 
-        let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+        let (_meta_offset, index_offset) = parse_footer(&data);
 
         // 1. Verify Index Block has multiple pointers
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
@@ -455,11 +502,11 @@ mod tests {
             file_size
         );
 
-        // Optional: If you know your standard block size is 4096, the file should be
-        // roughly: Block 1 (small) + Block 2 (10KB) + Block 3 (small) + Index + Footer.
-        // It should comfortably be under 20KB.
+        // The file should be roughly:
+        // Block 1 (small) + Block 2 (10KB) + Block 3 (small) + Meta + Index + Footer.
+        // The bloom filter adds ~12KB, so the total should be under 35KB.
         assert!(
-            file_size < 20 * 1024,
+            file_size < 35 * 1024,
             "File size ({} bytes) is unusually large, possible runaway allocation",
             file_size
         );

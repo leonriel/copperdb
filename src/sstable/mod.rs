@@ -6,14 +6,16 @@ pub mod block;
 pub mod reader;
 pub mod writer;
 
+type MetaOffset = u64;
 type IndexOffset = u64;
 type MagicNumber = u64;
 
 const MAGIC_NUMBER: MagicNumber = 0xDEADBEEFCAFEBABE;
 
+const META_OFFSET_SIZE: usize = size_of::<MetaOffset>();
 const INDEX_OFFSET_SIZE: usize = size_of::<IndexOffset>();
 const MAGIC_SIZE: usize = size_of::<MagicNumber>();
-const FOOTER_SIZE: usize = INDEX_OFFSET_SIZE + MAGIC_SIZE;
+const FOOTER_SIZE: usize = META_OFFSET_SIZE + INDEX_OFFSET_SIZE + MAGIC_SIZE;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SSTableError {
