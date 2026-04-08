@@ -1,7 +1,7 @@
 use std::fmt;
 use std::mem::size_of;
 
-use crate::sstable::{InternalKey, Record, RecordTag};
+use crate::core::{CoreError, InternalKey, Record, RecordTag};
 
 const TARGET_BLOCK_SIZE: usize = 4096;
 
@@ -39,6 +39,14 @@ impl std::error::Error for BlockError {}
 impl From<std::str::Utf8Error> for BlockError {
     fn from(err: std::str::Utf8Error) -> Self {
         BlockError::InvalidUtf8(err)
+    }
+}
+
+impl From<CoreError> for BlockError {
+    fn from(err: CoreError) -> Self {
+        match err {
+            CoreError::CorruptData(msg) => BlockError::CorruptData(msg)
+        }
     }
 }
 

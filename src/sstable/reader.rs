@@ -1,7 +1,8 @@
+use crate::core::{InternalKey, Record};
 use crate::sstable::block::{Block, BlockError};
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, InternalKey, MAGIC_NUMBER, MAGIC_SIZE,
-    MagicNumber, Record,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE,
+    MagicNumber,
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -158,8 +159,8 @@ impl SsTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sstable::KvIterator;
-    use crate::sstable::Record;
+    use crate::core::KvIterator;
+    use crate::core::Record;
     use crate::sstable::writer::SsTableBuilder;
     use std::fs::{self, File};
     use std::io::Write;

@@ -2,10 +2,10 @@
 use std::fs::File;
 use std::io::Write;
 
+use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, InternalKey, KvIterator, MAGIC_NUMBER, MAGIC_SIZE,
-    Record,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE,
 };
 
 #[derive(thiserror::Error, Debug)]
