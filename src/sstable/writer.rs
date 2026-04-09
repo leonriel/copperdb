@@ -25,6 +25,10 @@ pub struct SsTableBuilder {
     current_offset: IndexOffset,
     /// Tracks the first user_key added to the current block
     first_key_of_current_block: Option<String>,
+    /// First user_key written — set once on the first entry, never updated.
+    smallest_key: Option<String>,
+    /// Last user_key written — updated on every entry; holds the largest after build.
+    largest_key: Option<String>,
 }
 
 impl SsTableBuilder {
@@ -36,7 +40,19 @@ impl SsTableBuilder {
             block_index: Vec::new(),
             current_offset: 0,
             first_key_of_current_block: None,
+            smallest_key: None,
+            largest_key: None,
         })
+    }
+
+    /// Returns the inclusive key range `(smallest, largest)` of all entries
+    /// written to this SSTable. Returns `None` if the iterator was empty.
+    /// Must be called after `build_from_iterator`.
+    pub fn key_range(self) -> Option<(String, String)> {
+        match (self.smallest_key, self.largest_key) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
     }
 
     /// Consumes a MemTable iterator, slicing it into 4KB blocks and writing to disk.
@@ -64,6 +80,12 @@ impl SsTableBuilder {
                     ));
                 }
             }
+
+            // Track key range across the whole file
+            if self.smallest_key.is_none() {
+                self.smallest_key = Some(user_key.clone());
+            }
+            self.largest_key = Some(user_key.clone());
 
             // If this is the first entry in a block, save it for the index
             if self.first_key_of_current_block.is_none() {

@@ -56,7 +56,7 @@ pub struct Wal<C: Checksum> {
     _checksum: PhantomData<C>,
 }
 
-fn wal_path(dir: &Path, generation: u64) -> PathBuf {
+pub fn wal_path(dir: &Path, generation: u64) -> PathBuf {
     // Zero-padded so lexicographic order == numeric order.
     dir.join(format!("{:020}.wal", generation))
 }

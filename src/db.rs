@@ -1,7 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
@@ -12,62 +13,77 @@ const MAX_IMMUTABLE_TABLES: usize = 4;
 
 /// Core engine: coordinates WAL writes and MemTable inserts.
 ///
-/// Write path: WAL append → MemTable insert → rotate if frozen.
+/// Write path: WAL append → MemTable insert → rotate if frozen → signal flusher.
 /// Read path:  MemTableState (active first, then immutables in reverse order).
 /// Recovery:   replay all unflushed WAL files on `open`.
 pub struct LsmEngine {
-    state: MemTableState,
-    active_wal: Mutex<Wal<Crc32Checksum>>,
-    next_seq: AtomicU64,
-    next_wal_gen: AtomicU64,
-    data_dir: PathBuf,
+    pub(crate) state:    MemTableState,
+    active_wal:          Mutex<Wal<Crc32Checksum>>,
+    next_seq:            AtomicU64,
+    next_wal_gen:        AtomicU64,
+    pub(crate) data_dir: PathBuf,
+    next_sst_id:         AtomicU64,
+    flush_tx:            Sender<()>,
+}
+
+/// Returns the path for an SSTable file with the given ID.
+/// Zero-padded to 20 digits, matching the WAL naming convention.
+pub(crate) fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
+    dir.join(format!("{:020}.sst", file_id))
 }
 
 impl LsmEngine {
     /// Open (or create) an engine whose data lives in `dir`.
     ///
-    /// Any WAL files found in `dir` that have not yet been deleted are replayed
-    /// to restore pre-crash MemTable state.
-    pub fn open(dir: &Path) -> io::Result<Self> {
+    /// Replays unflushed WAL files before returning. Returns an `Arc` so the
+    /// engine can be shared with the background flusher thread.
+    pub fn open(dir: &Path) -> io::Result<Arc<Self>> {
+        Self::open_with_memtable_size(dir, MAX_MEMTABLE_SIZE)
+    }
+
+    pub(crate) fn open_with_memtable_size(dir: &Path, memtable_size: usize) -> io::Result<Arc<Self>> {
         std::fs::create_dir_all(dir)?;
 
         let records = recover_all::<Crc32Checksum>(dir)?;
-
-        // Continue numbering WAL generations from the highest seen so far.
         let next_gen = highest_wal_gen(dir) + 1;
         let max_seq = records.iter().map(|r| r.seq_num).max().unwrap_or(0);
 
-        // Explicitly tie the starting MemTable to the starting WAL generation
-        let state = MemTableState::new(MAX_IMMUTABLE_TABLES, MAX_MEMTABLE_SIZE, next_gen);
+        let state = MemTableState::new(MAX_IMMUTABLE_TABLES, memtable_size, next_gen);
 
         for r in records {
             let record = match r.op {
                 WalOpType::Put => Record::Put(r.value),
                 WalOpType::Delete => Record::Delete,
             };
-            // Ignore capacity limits during replay. All old WALs get merged 
-            // into this single starting MemTable.
             state.put(r.key, record, r.seq_num);
         }
 
-        // Create the active WAL file for new user writes
         let active_wal = Wal::<Crc32Checksum>::create(dir, next_gen)?;
 
-        Ok(Self {
+        // Recover next_sst_id by scanning for existing .sst files.
+        let next_sst_id = highest_sst_id(dir) + 1;
+
+        let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
+
+        let engine = Arc::new(Self {
             state,
             active_wal: Mutex::new(active_wal),
             next_seq: AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir: dir.to_path_buf(),
-        })
+            next_sst_id: AtomicU64::new(next_sst_id),
+            flush_tx,
+        });
+
+        // The flusher holds a Weak reference to avoid a cycle: if the engine Arc
+        // is dropped, the Weak upgrade fails and the flusher exits cleanly.
+        let flusher_weak = Arc::downgrade(&engine);
+        std::thread::spawn(move || crate::flusher::run(flusher_weak, flush_rx));
+
+        Ok(engine)
     }
 
     /// Durably write a key-value pair.
-    ///
-    /// The WAL record is flushed to the OS page cache before the MemTable is
-    /// touched. A crash between the two steps is safe to replay on the next
-    /// `open`. For a stronger guarantee (persist through power loss), call
-    /// `wal.sync()` — but that requires an fsync per write.
     pub fn put(&self, key: String, value: Vec<u8>) -> io::Result<()> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -76,7 +92,9 @@ impl LsmEngine {
             wal.append_put(seq, &key, &value)?;
         }
 
-        // put() returns the ID of the table if it needs freezing
+        // TODO: stall writes when flusher is falling behind
+        // (requires a Condvar notified by the flusher after each drop_immutable)
+
         if let Some(expected_id) = self.state.put(key, Record::Put(value), seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
@@ -101,6 +119,8 @@ impl LsmEngine {
             wal.append_delete(seq, &key)?;
         }
 
+        // TODO: stall writes when flusher is falling behind
+
         if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
@@ -108,43 +128,45 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Safely coordinates rotating BOTH the WAL file and the MemTable together.
-    /// Expects the ID of the MemTable that triggered the rotation request.
+    /// Claim a unique SSTable file ID. Called by the flusher before writing.
+    pub fn alloc_sst_id(&self) -> u64 {
+        self.next_sst_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     fn rotate_wal_and_memtable(&self, expected_id: u64) -> io::Result<()> {
-        // 1. Lock the WAL. This acts as our synchronization barrier.
         let mut wal_guard = self.active_wal.lock().unwrap();
-        
-        // 2. Identity-Based Double-Checked Locking!
-        // If the active table's ID no longer matches the ID of the table we 
-        // filled up, it means another thread already rotated it. Abort safely!
+
         if self.state.active_id() != expected_id {
             return Ok(());
         }
 
         let new_wal_gen = self.next_wal_gen.fetch_add(1, Ordering::SeqCst);
-        
-        // 3. Create the new WAL file
         let new_wal = Wal::<Crc32Checksum>::create(&self.data_dir, new_wal_gen)?;
-        
-        // 4. Freeze the MemTable and assign it the EXACT SAME ID
+
         self.state.freeze_active(new_wal_gen);
-        
-        // 5. Swap the active WAL
         *wal_guard = new_wal;
-        
+
+        self.flush_tx.send(()).ok();
+
         Ok(())
     }
 }
 
-/// Returns the highest generation number found among `*.wal` files in `dir`,
-/// or 0 if the directory is empty / contains no WAL files.
 fn highest_wal_gen(dir: &Path) -> u64 {
+    highest_numeric_stem(dir, "wal")
+}
+
+fn highest_sst_id(dir: &Path) -> u64 {
+    highest_numeric_stem(dir, "sst")
+}
+
+fn highest_numeric_stem(dir: &Path, ext: &str) -> u64 {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| {
             let path = e.ok()?.path();
-            if path.extension()?.to_str()? != "wal" {
+            if path.extension()?.to_str()? != ext {
                 return None;
             }
             path.file_stem()?.to_str()?.parse::<u64>().ok()
@@ -202,7 +224,6 @@ mod tests {
             engine.delete("temp".into()).unwrap();
         }
 
-        // Reopen — WAL replay should restore state.
         let engine = LsmEngine::open(&dir).unwrap();
         assert_eq!(engine.get("city"), Some(b"london".to_vec()));
         assert_eq!(engine.get("temp"), None);
@@ -222,7 +243,6 @@ mod tests {
         let engine = LsmEngine::open(&dir).unwrap();
         let post_crash_seq = engine.next_seq.load(Ordering::SeqCst);
 
-        // New seq must continue from where the previous run left off.
         assert!(
             post_crash_seq >= pre_crash_seq,
             "seq regressed: {} < {}",
