@@ -8,6 +8,7 @@ use crate::core::Record;
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
 use crate::manifest::{Manifest, VersionEdit, VersionState};
+use crate::sstable::reader::SsTableReader;
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
@@ -109,11 +110,81 @@ impl LsmEngine {
     }
 
     /// Look up a key. Returns `None` if the key was deleted or never written.
+    ///
+    /// Search order: active MemTable → immutable MemTables → L0 SSTables
+    /// (newest-first) → L1+ SSTables (binary search per level).
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        match self.state.get(key)? {
-            (Record::Put(v), _) => Some(v),
-            (Record::Delete, _) => None,
+        // 1. MemTables: active then immutables, newest first.
+        if let Some((record, _)) = self.state.get(key) {
+            return match record {
+                Record::Put(v) => Some(v),
+                Record::Delete => None,
+            };
         }
+
+        // 2. SSTables via the current version snapshot.
+        let version = self.current_version();
+
+        // L0 files may have overlapping key ranges. Scan newest-first (the
+        // Vec is in flush order — oldest at index 0 — so reverse it).
+        for meta in version.files_at_level(0).iter().rev() {
+            // Skip the file entirely if the key is outside its known range.
+            if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
+                continue;
+            }
+            let path = sst_path(&self.data_dir, meta.file_id);
+            let Some(path_str) = path.to_str() else { continue };
+            let mut reader = match SsTableReader::open(path_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[db] failed to open L0 SSTable {:?}: {}", path, e);
+                    continue;
+                }
+            };
+            match reader.search(key) {
+                Ok(Some((_, Record::Put(v)))) => return Some(v),
+                Ok(Some((_, Record::Delete))) => return None,
+                Ok(None) => {}
+                Err(e) => eprintln!("[db] error searching L0 SSTable {:?}: {}", path, e),
+            }
+        }
+
+        // L1+ files are non-overlapping and sorted by smallest_key within each
+        // level. Use partition_point to find the one candidate file per level.
+        for level in 1..7usize {
+            let files = version.files_at_level(level);
+            if files.is_empty() {
+                continue;
+            }
+
+            // Find the last file whose smallest_key <= key.
+            let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
+            if pos == 0 {
+                continue; // key precedes every file at this level
+            }
+            let meta = &files[pos - 1];
+            if meta.largest_key.as_str() < key {
+                continue; // key falls in a gap between files
+            }
+
+            let path = sst_path(&self.data_dir, meta.file_id);
+            let Some(path_str) = path.to_str() else { continue };
+            let mut reader = match SsTableReader::open(path_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[db] failed to open L{} SSTable {:?}: {}", level, path, e);
+                    continue;
+                }
+            };
+            match reader.search(key) {
+                Ok(Some((_, Record::Put(v)))) => return Some(v),
+                Ok(Some((_, Record::Delete))) => return None,
+                Ok(None) => {}
+                Err(e) => eprintln!("[db] error searching L{} SSTable {:?}: {}", level, path, e),
+            }
+        }
+
+        None
     }
 
     /// Durably delete a key by writing a tombstone.
