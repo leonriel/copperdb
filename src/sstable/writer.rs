@@ -4,6 +4,9 @@ use std::io::Write;
 
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
+use crate::sstable::{
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber,
+};
 use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE};
 
 #[derive(thiserror::Error, Debug)]
@@ -30,6 +33,10 @@ pub struct SsTableBuilder {
     current_offset: IndexOffset,
     /// Tracks the first user_key added to the current block
     first_key_of_current_block: Option<String>,
+    /// First user_key written — set once on the first entry, never updated.
+    smallest_key: Option<String>,
+    /// Last user_key written — updated on every entry; holds the largest after build.
+    largest_key: Option<String>,
 }
 
 impl SsTableBuilder {
@@ -41,7 +48,19 @@ impl SsTableBuilder {
             block_index: Vec::new(),
             current_offset: 0,
             first_key_of_current_block: None,
+            smallest_key: None,
+            largest_key: None,
         })
+    }
+
+    /// Returns the inclusive key range `(smallest, largest)` of all entries
+    /// written to this SSTable. Returns `None` if the iterator was empty.
+    /// Must be called after `build_from_iterator`.
+    pub fn key_range(self) -> Option<(String, String)> {
+        match (self.smallest_key, self.largest_key) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
     }
 
     /// Consumes a MemTable iterator, slicing it into 4KB blocks and writing to disk.
@@ -69,6 +88,12 @@ impl SsTableBuilder {
                     ));
                 }
             }
+
+            // Track key range across the whole file
+            if self.smallest_key.is_none() {
+                self.smallest_key = Some(user_key.clone());
+            }
+            self.largest_key = Some(user_key.clone());
 
             // If this is the first entry in a block, save it for the index
             if self.first_key_of_current_block.is_none() {
@@ -258,14 +283,14 @@ mod tests {
         assert!(data.len() >= FOOTER_SIZE);
 
         let len = data.len();
-        let magic = u64::from_be_bytes(data[len - 8..len].try_into().unwrap());
+        let magic = MagicNumber::from_be_bytes(data[len - MAGIC_SIZE..len].try_into().unwrap());
         assert_eq!(
-            magic, 0xDEADBEEFCAFEBABEu64,
+            magic, MAGIC_NUMBER,
             "Footer magic number is missing/corrupted"
         );
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
         assert_eq!(
             index_offset, 0,
             "Since there are no data blocks, index offset should be 0"
@@ -301,7 +326,7 @@ mod tests {
         let len = data.len();
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
 
         // 1. Verify Index Block
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
@@ -367,7 +392,7 @@ mod tests {
         let len = data.len();
 
         let index_offset =
-            u64::from_be_bytes(data[len - FOOTER_SIZE..len - 8].try_into().unwrap()) as usize;
+            IndexOffset::from_be_bytes(data[len - FOOTER_SIZE..len - MAGIC_SIZE].try_into().unwrap()) as usize;
 
         // 1. Verify Index Block has multiple pointers
         let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
