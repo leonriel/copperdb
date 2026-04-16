@@ -1,13 +1,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use crate::core::Record;
 use crate::memtable::state::MemTableState;
-use crate::manifest::{Manifest, VersionEdit, VersionState, sst_path};
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
+use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
 use crate::sstable::reader::SsTableReader;
 
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
@@ -24,11 +24,11 @@ pub struct LsmEngine {
     next_seq:            AtomicU64,
     next_wal_gen:        AtomicU64,
     pub(crate) data_dir: PathBuf,
-    manifest:            Mutex<Manifest>,
-    version:             RwLock<Arc<VersionState>>,
+    version:             SharedVersion,
     next_sst_id:         AtomicU64,
-    flush_tx:            Sender<()>,
     compact_tx:          Sender<()>,
+    manifest:            Mutex<Manifest>,
+    flush_tx:            Sender<()>,
 }
 
 impl LsmEngine {
@@ -40,7 +40,10 @@ impl LsmEngine {
         Self::open_with_memtable_size(dir, MAX_MEMTABLE_SIZE)
     }
 
-    pub(crate) fn open_with_memtable_size(dir: &Path, memtable_size: usize) -> io::Result<Arc<Self>> {
+    pub(crate) fn open_with_memtable_size(
+        dir: &Path,
+        memtable_size: usize,
+    ) -> io::Result<Arc<Self>> {
         std::fs::create_dir_all(dir)?;
 
         let records = recover_all::<Crc32Checksum>(dir)?;
@@ -54,17 +57,19 @@ impl LsmEngine {
                 WalOpType::Put    => Record::Put(r.value),
                 WalOpType::Delete => Record::Delete,
             };
+            // Ignore capacity limits during replay. All old WALs get merged
+            // into this single starting MemTable.
             state.put(r.key, record, r.seq_num);
         }
 
         let active_wal = Wal::<Crc32Checksum>::create(dir, next_gen)?;
 
+        let (compact_tx, compact_rx) = std::sync::mpsc::channel::<()>();
         let (manifest, version_state) = Manifest::open_or_create(dir)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let next_sst_id = version_state.all_file_ids().max().unwrap_or(0) + 1;
 
         let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
-        let (compact_tx, compact_rx) = std::sync::mpsc::channel::<()>();
 
         let engine = Arc::new(Self {
             state,
@@ -72,18 +77,21 @@ impl LsmEngine {
             next_seq:     AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir:     dir.to_path_buf(),
+            version:      SharedVersion::new(),
+            compact_tx,
             manifest:     Mutex::new(manifest),
-            version:      RwLock::new(Arc::new(version_state)),
             next_sst_id:  AtomicU64::new(next_sst_id),
             flush_tx,
-            compact_tx,
         });
-
-        let flusher_weak = Arc::downgrade(&engine);
-        std::thread::spawn(move || crate::flusher::run(flusher_weak, flush_rx));
 
         let compaction_weak = Arc::downgrade(&engine);
         std::thread::spawn(move || crate::compaction::run(compaction_weak, compact_rx));
+            
+
+        // The flusher holds a Weak reference to avoid a cycle: if the engine Arc
+        // is dropped, the Weak upgrade fails and the flusher exits cleanly.
+        let flusher_weak = Arc::downgrade(&engine);
+        std::thread::spawn(move || crate::flusher::run(flusher_weak, flush_rx));
 
         Ok(engine)
     }
@@ -96,6 +104,9 @@ impl LsmEngine {
             wal.append_put(seq, &key, &value)?;
         }
 
+        // TODO: stall writes when flusher is falling behind
+        // (requires a Condvar notified by the flusher after each drop_immutable)
+
         if let Some(expected_id) = self.state.put(key, Record::Put(value), seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
@@ -107,6 +118,7 @@ impl LsmEngine {
     /// Search order: active MemTable → immutable MemTables → L0 SSTables
     /// (newest-first) → L1+ SSTables (binary search per level).
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+        // 1. MemTables: active then immutables, newest first.
         if let Some((record, _)) = self.state.get(key) {
             return match record {
                 Record::Put(v) => Some(v),
@@ -114,11 +126,13 @@ impl LsmEngine {
             };
         }
 
+        // 2. SSTables via the current version snapshot.
         let version = self.current_version();
 
         // L0 files may have overlapping key ranges. Scan newest-first (the
         // Vec is in flush order — oldest at index 0 — so reverse it).
         for meta in version.files_at_level(0).iter().rev() {
+            // Skip the file entirely if the key is outside its known range.
             if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
                 continue;
             }
@@ -147,13 +161,14 @@ impl LsmEngine {
                 continue;
             }
 
+            // Find the last file whose smallest_key <= key.
             let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
             if pos == 0 {
-                continue;
+                continue; // key precedes every file at this level
             }
             let meta = &files[pos - 1];
             if meta.largest_key.as_str() < key {
-                continue;
+                continue; // key falls in a gap between files
             }
 
             let path = sst_path(&self.data_dir, meta.file_id);
@@ -184,13 +199,19 @@ impl LsmEngine {
             wal.append_delete(seq, &key)?;
         }
 
+        // TODO: stall writes when flusher is falling behind
+
         if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
         Ok(())
     }
 
-    /// Claim a unique SSTable file ID.
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
     pub fn alloc_sst_id(&self) -> u64 {
         self.next_sst_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -198,7 +219,7 @@ impl LsmEngine {
     /// Expose a read snapshot of the current version for the flusher and
     /// compaction worker. Callers get an Arc clone without holding the lock.
     pub fn current_version(&self) -> Arc<VersionState> {
-        Arc::clone(&self.version.read().unwrap())
+        self.version.snapshot()
     }
 
     /// Called by the flusher after successfully writing an SSTable file.
@@ -213,11 +234,7 @@ impl LsmEngine {
         let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
 
         self.manifest.lock().unwrap().append(&edit)?;
-
-        let mut guard = self.version.write().unwrap();
-        let mut new_version = (**guard).clone();
-        new_version.apply(&edit);
-        *guard = Arc::new(new_version);
+        self.version.apply(&[edit]);
 
         self.compact_tx.send(()).ok();
 
@@ -231,36 +248,31 @@ impl LsmEngine {
         removed: &[(u8, u64)],
         added: &[(u8, u64, String, String)],
     ) -> io::Result<()> {
-        let mut manifest = self.manifest.lock().unwrap();
+        let mut edits: Vec<VersionEdit> = Vec::with_capacity(removed.len() + added.len());
 
         for &(level, file_id) in removed {
-            manifest.append(&VersionEdit::RemoveFile { level, file_id })?;
+            edits.push(VersionEdit::RemoveFile { level, file_id });
         }
         for (level, file_id, smallest_key, largest_key) in added {
-            manifest.append(&VersionEdit::AddFile {
-                level:        *level,
-                file_id:      *file_id,
-                smallest_key: smallest_key.clone(),
-                largest_key:  largest_key.clone(),
-            })?;
-        }
-        drop(manifest);
-
-        let mut guard = self.version.write().unwrap();
-        let mut new_version = (**guard).clone();
-        for &(level, file_id) in removed {
-            new_version.apply(&VersionEdit::RemoveFile { level, file_id });
-        }
-        for (level, file_id, smallest_key, largest_key) in added {
-            new_version.apply(&VersionEdit::AddFile {
+            edits.push(VersionEdit::AddFile {
                 level:        *level,
                 file_id:      *file_id,
                 smallest_key: smallest_key.clone(),
                 largest_key:  largest_key.clone(),
             });
         }
-        *guard = Arc::new(new_version);
 
+        {
+            let mut manifest = self.manifest.lock().unwrap();
+            for edit in &edits {
+                manifest.append(edit)?;
+            }
+        }
+
+        self.version.apply(&edits);
+
+        // Wake the compaction worker again in case multiple levels are over
+        // threshold — one compaction per wakeup, so we need to keep firing.
         self.compact_tx.send(()).ok();
 
         Ok(())
@@ -271,7 +283,7 @@ impl LsmEngine {
 
         // Identity-Based Double-Checked Locking:
         // If the active table's ID no longer matches the ID of the table we
-        // filled up, another thread already rotated it. Abort safely.
+        // filled up, it means another thread already rotated it. Abort safely!
         if self.state.active_id() != expected_id {
             return Ok(());
         }
@@ -316,6 +328,8 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+
+    // --- existing tests ---
 
     #[test]
     fn put_and_get() {
@@ -378,6 +392,8 @@ mod tests {
         assert_eq!(engine.get("k"), Some(b"v2".to_vec()));
     }
 
+    // --- get() ---
+
     #[test]
     fn get_returns_latest_value_after_overwrite() {
         let dir = tmp_dir();
@@ -411,12 +427,18 @@ mod tests {
         }
     }
 
+    // After an active memtable is frozen into an immutable, get() must still
+    // find keys that lived only in the frozen table.
     #[test]
     fn get_finds_key_in_immutable_table_after_freeze() {
+        // Use a tiny memtable so the first big write forces a rotation.
         let dir = tmp_dir();
         let engine = LsmEngine::open_with_memtable_size(&dir, 128).unwrap();
         engine.put("old".into(), b"value".to_vec()).unwrap();
+        // This large write should push the active table over 128 bytes and
+        // rotate it to the immutable queue.
         engine.put("filler".into(), vec![0u8; 256]).unwrap();
+        // "old" is now in the immutable table; the active table holds "filler".
         assert_eq!(engine.get("old"), Some(b"value".to_vec()));
         assert!(engine.get("filler").is_some());
     }
@@ -426,16 +448,22 @@ mod tests {
         let dir = tmp_dir();
         let engine = LsmEngine::open_with_memtable_size(&dir, 128).unwrap();
         engine.put("key".into(), b"alive".to_vec()).unwrap();
+        // Force a freeze so "key"="alive" lands in an immutable table.
         engine.put("filler".into(), vec![0u8; 256]).unwrap();
+        // Write a tombstone for "key" into the new active table.
         engine.delete("key".into()).unwrap();
+        // The tombstone in the active table must shadow the value in immutable.
         assert_eq!(engine.get("key"), None);
     }
+
+    // --- record_compaction() ---
 
     #[test]
     fn record_compaction_removes_inputs_and_registers_outputs() {
         let dir = tmp_dir();
         let engine = LsmEngine::open(&dir).unwrap();
 
+        // Seed two L0 files.
         engine.record_compaction(
             &[],
             &[
@@ -445,6 +473,7 @@ mod tests {
         ).unwrap();
         assert_eq!(engine.current_version().files_at_level(0).len(), 2);
 
+        // Compact L0 → L1.
         engine.record_compaction(
             &[(0, 1), (0, 2)],
             &[(1, 3, "a".to_string(), "f".to_string())],
@@ -485,6 +514,7 @@ mod tests {
 
         let v = engine.current_version();
         assert_eq!(v.files_at_level(1).len(), 2);
+        // L1 files are kept sorted by smallest_key.
         assert_eq!(v.files_at_level(1)[0].file_id, 10);
         assert_eq!(v.files_at_level(1)[1].file_id, 11);
     }
@@ -504,6 +534,7 @@ mod tests {
     fn record_compaction_removes_nonexistent_file_is_safe() {
         let dir = tmp_dir();
         let engine = LsmEngine::open(&dir).unwrap();
+        // Removing a file that was never registered must not panic or corrupt state.
         engine.record_compaction(&[(0, 999)], &[]).unwrap();
         assert!(engine.current_version().files_at_level(0).is_empty());
     }
@@ -522,6 +553,7 @@ mod tests {
             ],
         ).unwrap();
 
+        // Compact L1 file into L2.
         engine.record_compaction(
             &[(1, 2)],
             &[(2, 4, "c".to_string(), "f".to_string())],
@@ -533,15 +565,21 @@ mod tests {
         assert_eq!(v.files_at_level(2).len(), 2, "original L2 + new output");
     }
 
+    // --- concurrency ---
+
+    // get() must never panic or return garbage while record_compaction() is
+    // concurrently replacing the version state.
     #[test]
     fn concurrent_get_and_record_compaction_no_panic() {
         let dir = tmp_dir();
         let engine = Arc::new(LsmEngine::open(&dir).unwrap());
 
+        // Pre-populate the memtable so get() has real data to return.
         for i in 0u32..100 {
             engine.put(format!("key_{:04}", i), vec![i as u8]).unwrap();
         }
 
+        // Seed an initial file so the compaction thread has something to remove.
         engine.record_compaction(
             &[],
             &[(0, 1000, "key_0000".to_string(), "key_0099".to_string())],
@@ -550,6 +588,7 @@ mod tests {
         let e1 = Arc::clone(&engine);
         let compactor = thread::spawn(move || {
             for id in 0u64..200 {
+                // Alternate between adding and then removing the same file.
                 e1.record_compaction(
                     &[(0, 1000)],
                     &[(1, 2000 + id, "key_0000".to_string(), "key_0099".to_string())],
@@ -573,17 +612,21 @@ mod tests {
         compactor.join().unwrap();
         reader.join().unwrap();
 
+        // Memtable data must remain intact.
         for i in 0u32..100 {
             assert_eq!(engine.get(&format!("key_{:04}", i)), Some(vec![i as u8]));
         }
     }
 
+    // Concurrent puts, gets, and record_compaction calls must not deadlock or
+    // corrupt the version state.
     #[test]
     fn concurrent_put_get_and_record_compaction() {
         let dir = tmp_dir();
         let engine = Arc::new(LsmEngine::open(&dir).unwrap());
         let mut handles = vec![];
 
+        // Writer threads.
         for t in 0u32..4 {
             let e = Arc::clone(&engine);
             handles.push(thread::spawn(move || {
@@ -593,6 +636,7 @@ mod tests {
             }));
         }
 
+        // Reader threads.
         for _ in 0..4 {
             let e = Arc::clone(&engine);
             handles.push(thread::spawn(move || {
@@ -603,6 +647,7 @@ mod tests {
             }));
         }
 
+        // Version-mutation threads (simulating compaction results arriving).
         for base in 0u64..4 {
             let e = Arc::clone(&engine);
             handles.push(thread::spawn(move || {
@@ -625,6 +670,7 @@ mod tests {
             h.join().unwrap();
         }
 
+        // Writes made by the writer threads must all be readable.
         for t in 0u32..4 {
             for i in 0u32..100 {
                 assert_eq!(

@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::mem::size_of;
+use std::sync::{Arc, RwLock};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManifestError {
@@ -155,6 +156,39 @@ impl VersionState {
             .iter()
             .filter(|m| m.smallest_key <= hi.to_string() && m.largest_key >= lo.to_string())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SharedVersion — the CoW wrapper used by LsmEngine
+// ---------------------------------------------------------------------------
+
+/// Thread-safe CoW container for the current `VersionState`.
+///
+/// Readers clone the inner `Arc` under a brief read-lock; writers clone the
+/// whole `VersionState`, mutate the copy, and swap the `Arc` under a
+/// write-lock — giving readers an atomic, wait-free view.
+pub struct SharedVersion(RwLock<Arc<VersionState>>);
+
+impl SharedVersion {
+    pub fn new() -> Self {
+        Self(RwLock::new(Arc::new(VersionState::new())))
+    }
+
+    /// Returns a point-in-time snapshot. Callers can read freely without
+    /// holding any lock.
+    pub fn snapshot(&self) -> Arc<VersionState> {
+        Arc::clone(&self.0.read().unwrap())
+    }
+
+    /// Atomically apply one or more edits to the version state.
+    pub fn apply(&self, edits: &[VersionEdit]) {
+        let mut guard = self.0.write().unwrap();
+        let mut next = (**guard).clone();
+        for edit in edits {
+            next.apply(edit);
+        }
+        *guard = Arc::new(next);
     }
 }
 

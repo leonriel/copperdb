@@ -10,7 +10,7 @@ use crate::core::{InternalKey, KvIterator, Record};
 use crate::db::LsmEngine;
 use crate::manifest::{SstableMetadata, VersionState, sst_path};
 use crate::sstable::block::Block;
-use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER};
+use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER, META_OFFSET_SIZE};
 use crate::sstable::writer::SsTableBuilder;
 
 // ---------------------------------------------------------------------------
@@ -80,13 +80,22 @@ impl SsTableIterator {
         let mut footer_buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer_buf)?;
 
+        let meta_offset = u64::from_be_bytes(
+            footer_buf[0..META_OFFSET_SIZE]
+                .try_into()
+                .map_err(|_| CompactionError::SSTable("Failed to parse meta offset".to_string()))?,
+        );
+
+        let index_offset_offset = META_OFFSET_SIZE;
         let index_offset = u64::from_be_bytes(
-            footer_buf[..INDEX_OFFSET_SIZE]
+            footer_buf[index_offset_offset..index_offset_offset + INDEX_OFFSET_SIZE]
                 .try_into()
                 .map_err(|_| CompactionError::SSTable("Failed to parse index offset".to_string()))?,
         );
+
+        let magic_offset = META_OFFSET_SIZE + INDEX_OFFSET_SIZE;
         let magic = u64::from_be_bytes(
-            footer_buf[INDEX_OFFSET_SIZE..]
+            footer_buf[magic_offset..]
                 .try_into()
                 .map_err(|_| CompactionError::SSTable("Failed to parse magic number".to_string()))?,
         );
@@ -98,7 +107,7 @@ impl SsTableIterator {
             )));
         }
 
-        // Read the index block.
+        // Read the index block (sits between meta block and footer).
         let index_size = file_len
             .saturating_sub(FOOTER_SIZE as u64)
             .saturating_sub(index_offset) as usize;
@@ -147,7 +156,7 @@ impl SsTableIterator {
             let end = if i + 1 < block_starts.len() {
                 block_starts[i + 1]
             } else {
-                index_offset
+                meta_offset
             };
             block_ranges.push((start, end));
         }
