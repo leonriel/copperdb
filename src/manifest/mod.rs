@@ -175,6 +175,12 @@ impl SharedVersion {
         Self(RwLock::new(Arc::new(VersionState::new())))
     }
 
+    /// Create a `SharedVersion` pre-loaded with a replayed `VersionState`.
+    /// Used during engine recovery to restore the manifest state from disk.
+    pub fn from_state(state: VersionState) -> Self {
+        Self(RwLock::new(Arc::new(state)))
+    }
+
     /// Returns a point-in-time snapshot. Callers can read freely without
     /// holding any lock.
     pub fn snapshot(&self) -> Arc<VersionState> {
