@@ -7,7 +7,6 @@ use crate::sstable::block::BlockBuilder;
 use crate::sstable::{
     FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber,
 };
-use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE};
 
 #[derive(thiserror::Error, Debug)]
 pub enum WriterError {
