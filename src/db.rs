@@ -10,8 +10,14 @@ use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
 use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
 use crate::sstable::reader::SsTableReader;
 
+use std::time::Duration;
+
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
+
+/// How long a write will block waiting for the flusher to drain the immutable
+/// queue before giving up and returning an error.
+const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Core engine: coordinates WAL writes and MemTable inserts.
 ///
@@ -97,6 +103,9 @@ impl LsmEngine {
     }
 
     /// Durably write a key-value pair.
+    ///
+    /// Blocks if the immutable memtable queue is full (backpressure). Returns
+    /// an error if the flusher cannot drain the queue within the timeout.
     pub fn put(&self, key: String, value: Vec<u8>) -> io::Result<()> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         {
@@ -104,8 +113,7 @@ impl LsmEngine {
             wal.append_put(seq, &key, &value)?;
         }
 
-        // TODO: stall writes when flusher is falling behind
-        // (requires a Condvar notified by the flusher after each drop_immutable)
+        self.wait_for_flush_capacity()?;
 
         if let Some(expected_id) = self.state.put(key, Record::Put(value), seq) {
             self.rotate_wal_and_memtable(expected_id)?;
@@ -192,6 +200,9 @@ impl LsmEngine {
     }
 
     /// Durably delete a key by writing a tombstone.
+    ///
+    /// Blocks if the immutable memtable queue is full (backpressure). Returns
+    /// an error if the flusher cannot drain the queue within the timeout.
     pub fn delete(&self, key: String) -> io::Result<()> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         {
@@ -199,7 +210,7 @@ impl LsmEngine {
             wal.append_delete(seq, &key)?;
         }
 
-        // TODO: stall writes when flusher is falling behind
+        self.wait_for_flush_capacity()?;
 
         if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
             self.rotate_wal_and_memtable(expected_id)?;
@@ -210,6 +221,23 @@ impl LsmEngine {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Blocks if the flusher is falling behind, giving it time to drain
+    /// immutable memtables before we pile on more. Returns an error if the
+    /// timeout expires while the queue is still full.
+    fn wait_for_flush_capacity(&self) -> io::Result<()> {
+        if !self.state.is_flush_falling_behind() {
+            return Ok(());
+        }
+        if self.state.wait_if_stalled(BACKPRESSURE_TIMEOUT) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "write stalled: flusher cannot keep up (immutable memtable queue full)",
+            ))
+        }
+    }
 
     /// Claim a unique SSTable file ID. Called by the flusher before writing a new .sst file.
     pub fn alloc_sst_id(&self) -> u64 {
@@ -676,6 +704,108 @@ mod tests {
                 assert_eq!(
                     engine.get(&format!("t{}k{:04}", t, i)),
                     Some(vec![(t + i) as u8]),
+                );
+            }
+        }
+    }
+
+    // --- backpressure ---
+
+    /// Writes that pile up faster than the flusher can drain should stall
+    /// rather than filling unbounded memory. With the real flusher running,
+    /// writes should eventually complete once the queue drains.
+    #[test]
+    fn writes_succeed_under_backpressure_with_flusher() {
+        // Small memtable to trigger frequent freezes, but large enough that
+        // the SSTable index block stays within the 4KB limit (~50 blocks max).
+        const SMALL_MEMTABLE: usize = 32 * 1024;
+        let dir = tmp_dir();
+        let engine = LsmEngine::open_with_memtable_size(&dir, SMALL_MEMTABLE).unwrap();
+
+        // Write enough data to trigger several freezes and fill the immutable
+        // queue, exercising backpressure. ~500 entries × ~120 bytes ≈ 60 KB →
+        // about 2 flushes, which is enough to stall without overwhelming the
+        // compactor into a race with the flusher.
+        let entries: Vec<(String, Vec<u8>)> = (0u64..500)
+            .map(|i| (format!("key_{:08}", i), vec![i as u8; 100]))
+            .collect();
+
+        for (k, v) in &entries {
+            engine
+                .put(k.clone(), v.clone())
+                .expect("write should succeed once flusher drains the queue");
+        }
+
+        // Give the flusher and compactor time to settle.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // All keys must be readable.
+        for (k, v) in &entries {
+            assert_eq!(
+                engine.get(k).as_deref(),
+                Some(v.as_slice()),
+                "{} should be readable after backpressure",
+                k,
+            );
+        }
+    }
+
+    /// Delete operations should also respect backpressure.
+    #[test]
+    fn deletes_succeed_under_backpressure_with_flusher() {
+        const SMALL_MEMTABLE: usize = 32 * 1024;
+        let dir = tmp_dir();
+        let engine = LsmEngine::open_with_memtable_size(&dir, SMALL_MEMTABLE).unwrap();
+
+        for i in 0u64..500 {
+            engine
+                .put(format!("key_{:08}", i), vec![i as u8; 100])
+                .unwrap();
+        }
+        for i in 0u64..500 {
+            engine
+                .delete(format!("key_{:08}", i))
+                .expect("delete should succeed under backpressure");
+        }
+
+        for i in 0u64..500 {
+            assert_eq!(
+                engine.get(&format!("key_{:08}", i)),
+                None,
+                "key_{:08} should be deleted",
+                i,
+            );
+        }
+    }
+
+    /// Concurrent writers under backpressure should all complete without
+    /// deadlock or data loss.
+    #[test]
+    fn concurrent_writes_under_backpressure() {
+        const SMALL_MEMTABLE: usize = 32 * 1024;
+        let dir = tmp_dir();
+        let engine = Arc::new(LsmEngine::open_with_memtable_size(&dir, SMALL_MEMTABLE).unwrap());
+
+        let mut handles = vec![];
+        for t in 0u32..4 {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for i in 0u32..200 {
+                    e.put(format!("t{}k{:04}", t, i), vec![(t + i) as u8; 100])
+                        .expect("concurrent write should succeed");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for t in 0u32..4 {
+            for i in 0u32..200 {
+                assert_eq!(
+                    engine.get(&format!("t{}k{:04}", t, i)),
+                    Some(vec![(t + i) as u8; 100]),
                 );
             }
         }

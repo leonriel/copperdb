@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::memtable::{CrossbeamMemTable, MemTable, QueryResult, Record};
 
@@ -24,6 +25,9 @@ struct InnerState {
 pub struct MemTableState {
     inner: RwLock<Arc<InnerState>>,
     max_memtable_size: usize,
+    /// Writers block on this condvar when the immutable queue is full.
+    /// The flusher signals it after each `drop_immutable` to wake stalled writers.
+    flush_cond: (Mutex<()>, Condvar),
 }
 
 impl MemTableState {
@@ -36,6 +40,7 @@ impl MemTableState {
         Self {
             inner: RwLock::new(Arc::new(initial_state)),
             max_memtable_size,
+            flush_cond: (Mutex::new(()), Condvar::new()),
         }
     }
 
@@ -103,6 +108,18 @@ impl MemTableState {
         guard.immutable.len() >= guard.max_immutable_tables
     }
 
+    /// Blocks the calling thread until the immutable queue drops below the
+    /// backpressure threshold. Returns `true` if the wait completed normally,
+    /// `false` if the timeout expired while still stalled.
+    pub fn wait_if_stalled(&self, timeout: Duration) -> bool {
+        let (lock, cvar) = &self.flush_cond;
+        let guard = lock.lock().unwrap();
+        let result = cvar
+            .wait_timeout_while(guard, timeout, |_| self.is_flush_falling_behind())
+            .unwrap();
+        !result.1.timed_out()
+    }
+
     /// Returns a clone of the Arc pointing to the oldest immutable MemTable.
     /// Returns None if there are no immutable tables waiting to be flushed.
     pub fn get_oldest_immutable(&self) -> Option<Arc<CrossbeamMemTable>> {
@@ -117,6 +134,7 @@ impl MemTableState {
 
     /// Safely removes a specific MemTable from the immutable list using CoW.
     /// This should ONLY be called after the table is safely flushed to disk.
+    /// Notifies any writers blocked on backpressure that space has freed up.
     pub fn drop_immutable(&self, table_to_drop: &Arc<CrossbeamMemTable>) {
         let mut guard = self.inner.write().unwrap();
 
@@ -131,6 +149,9 @@ impl MemTableState {
 
                 // 3. The Swap
                 *guard = Arc::new(new_state);
+
+                // 4. Wake all stalled writers — the queue just shrank.
+                self.flush_cond.1.notify_all();
             }
         }
     }
@@ -554,5 +575,89 @@ mod tests {
             1,
             "Concurrent drops caused too many tables to be removed!"
         );
+    }
+
+    // ==========================================
+    // BACKPRESSURE TESTS
+    // ==========================================
+
+    #[test]
+    fn test_not_stalled_when_below_threshold() {
+        let state = MemTableState::new(4, 50, 1);
+        assert!(!state.is_flush_falling_behind());
+        // Should return immediately (not block)
+        assert!(state.wait_if_stalled(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn test_stalled_when_immutable_queue_full() {
+        // max_immutable_tables = 2 for a faster test
+        let state = MemTableState::new(2, 50, 1);
+
+        // Fill up the immutable queue: freeze twice
+        state.put("k1".to_string(), Record::Put(vec![0; 100]), 1);
+        state.freeze_active(2);
+        state.put("k2".to_string(), Record::Put(vec![0; 100]), 2);
+        state.freeze_active(3);
+
+        assert!(state.is_flush_falling_behind());
+        // Should time out because nobody is draining
+        assert!(!state.wait_if_stalled(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn test_wait_if_stalled_unblocks_on_drop_immutable() {
+        let state = Arc::new(MemTableState::new(2, 50, 1));
+
+        // Fill the immutable queue
+        state.put("k1".to_string(), Record::Put(vec![0; 100]), 1);
+        state.freeze_active(2);
+        state.put("k2".to_string(), Record::Put(vec![0; 100]), 2);
+        state.freeze_active(3);
+
+        assert!(state.is_flush_falling_behind());
+
+        // Spawn a "flusher" that drains one table after a short delay
+        let flusher_state = Arc::clone(&state);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let oldest = flusher_state.get_oldest_immutable().unwrap();
+            flusher_state.drop_immutable(&oldest);
+        });
+
+        // This should block briefly, then unblock once the flusher drains
+        let unblocked = state.wait_if_stalled(Duration::from_secs(2));
+        assert!(unblocked, "Writer should have been unblocked by the flusher");
+        assert!(!state.is_flush_falling_behind());
+    }
+
+    #[test]
+    fn test_multiple_writers_unblock_after_drain() {
+        let state = Arc::new(MemTableState::new(2, 50, 1));
+
+        // Fill the queue
+        state.put("k1".to_string(), Record::Put(vec![0; 100]), 1);
+        state.freeze_active(2);
+        state.put("k2".to_string(), Record::Put(vec![0; 100]), 2);
+        state.freeze_active(3);
+
+        // Spawn several stalled writers
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let s = Arc::clone(&state);
+            handles.push(thread::spawn(move || {
+                s.wait_if_stalled(Duration::from_secs(2))
+            }));
+        }
+
+        // Flusher drains one table
+        thread::sleep(Duration::from_millis(30));
+        let oldest = state.get_oldest_immutable().unwrap();
+        state.drop_immutable(&oldest);
+
+        // All writers should have been woken up
+        for h in handles {
+            assert!(h.join().unwrap(), "All stalled writers should unblock");
+        }
     }
 }
