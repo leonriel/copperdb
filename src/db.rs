@@ -208,44 +208,6 @@ impl LsmEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Methods used by the compaction worker
-    // -----------------------------------------------------------------------
-
-    /// Called by the compaction worker after writing new SSTable files.
-    /// Atomically removes the input files and registers the outputs in the
-    /// in-memory version state.
-    ///
-    /// NOTE: on this branch there is no manifest file; persistence comes from
-    /// the flusher branch when the two are merged.
-    // pub fn record_compaction(
-    //     &self,
-    //     removed: &[(u8, u64)],
-    //     added:   &[(u8, u64, String, String)],
-    // ) -> io::Result<()> {
-    //     let mut edits: Vec<VersionEdit> = Vec::with_capacity(removed.len() + added.len());
-
-    //     for &(level, file_id) in removed {
-    //         edits.push(VersionEdit::RemoveFile { level, file_id });
-    //     }
-    //     for (level, file_id, smallest_key, largest_key) in added {
-    //         edits.push(VersionEdit::AddFile {
-    //             level:        *level,
-    //             file_id:      *file_id,
-    //             smallest_key: smallest_key.clone(),
-    //             largest_key:  largest_key.clone(),
-    //         });
-    //     }
-
-    //     self.version.apply(&edits);
-
-    //     // Wake the compaction worker again in case multiple levels are over
-    //     // threshold — one compaction per wakeup, so we need to keep firing.
-    //     self.compact_tx.send(()).ok();
-
-    //     Ok(())
-    // }
-
-    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
