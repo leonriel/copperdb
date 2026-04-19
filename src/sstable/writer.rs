@@ -192,6 +192,8 @@ impl SsTableBuilder {
             }
         }
 
+        self.bloom.set(&user_key.to_string());
+
         if self.smallest_key.is_none() {
             self.smallest_key = Some(user_key.to_string());
         }
@@ -211,14 +213,22 @@ impl SsTableBuilder {
         self.current_offset
     }
 
-    /// Flush remaining buffered data, write the index block and footer, then
-    /// sync. Returns `Some((smallest_key, largest_key))` if any entries were
-    /// written, or `None` for an empty file.
+    /// Flush remaining buffered data, write the meta block (bloom filter),
+    /// index block, and footer, then sync. Returns
+    /// `Some((smallest_key, largest_key))` if any entries were written, or
+    /// `None` for an empty file.
     pub fn finish_file(mut self) -> Result<Option<(String, String)>, WriterError> {
         if !self.current_block.is_empty() {
             self.finish_current_block()?;
         }
 
+        // Write the Meta Block (serialized bloom filter)
+        let meta_offset = self.current_offset;
+        let meta_data = self.bloom.to_bytes();
+        self.file.write_all(&meta_data)?;
+        self.current_offset += meta_data.len() as u64;
+
+        // Build and write the Index Block
         let mut index_block = BlockBuilder::new();
         for (first_key, offset) in &self.block_index {
             let index_key = InternalKey {
@@ -236,13 +246,15 @@ impl SsTableBuilder {
 
         let index_data = index_block.build();
         let index_offset = self.current_offset;
-
         self.file.write_all(&index_data)?;
 
+        // Write the Footer: [meta_offset | index_offset | magic]
         let mut footer = [0u8; FOOTER_SIZE];
-        let index_end = INDEX_OFFSET_SIZE;
+        let meta_end = META_OFFSET_SIZE;
+        let index_end = meta_end + INDEX_OFFSET_SIZE;
         let magic_end = index_end + MAGIC_SIZE;
-        footer[0..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[0..meta_end].copy_from_slice(&meta_offset.to_be_bytes());
+        footer[meta_end..index_end].copy_from_slice(&index_offset.to_be_bytes());
         footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
         self.file.write_all(&footer)?;
         self.file.sync_all()?;
@@ -570,6 +582,57 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Files built with `add_entry` + `finish_file` must be readable by
+    /// `SsTableReader::open` and return correct results from `search`.
+    #[test]
+    fn test_finish_file_readable_by_reader() {
+        use crate::sstable::reader::SsTableReader;
+
+        let file = TempFileGuard::new("finish_file_reader.sst");
+        let mut builder = SsTableBuilder::new(file.path_str()).unwrap();
+
+        // Write entries via add_entry (sorted by user_key asc, seq_num desc).
+        builder.add_entry("apple",  &Record::Put(b("red")),    10).unwrap();
+        builder.add_entry("apple",  &Record::Put(b("green")),   5).unwrap();
+        builder.add_entry("banana", &Record::Put(b("yellow")),  8).unwrap();
+        builder.add_entry("cherry", &Record::Delete,             3).unwrap();
+        builder.add_entry("date",   &Record::Put(b("brown")),   1).unwrap();
+
+        let key_range = builder.finish_file().unwrap();
+        assert_eq!(
+            key_range,
+            Some(("apple".to_string(), "date".to_string())),
+            "finish_file should return the correct key range",
+        );
+
+        // The file must be openable by SsTableReader.
+        let mut reader = SsTableReader::open(file.path_str()).unwrap();
+
+        // Put: returns the newest version.
+        let (key, record) = reader.search("apple").unwrap().unwrap();
+        assert_eq!(key.user_key, "apple");
+        assert_eq!(key.seq_num, 10);
+        assert_eq!(record, Record::Put(b("red")));
+
+        // Put: single version.
+        let (key, record) = reader.search("banana").unwrap().unwrap();
+        assert_eq!(key.user_key, "banana");
+        assert_eq!(record, Record::Put(b("yellow")));
+
+        // Delete tombstone.
+        let (key, record) = reader.search("cherry").unwrap().unwrap();
+        assert_eq!(key.user_key, "cherry");
+        assert!(matches!(record, Record::Delete));
+
+        // Last key.
+        let (key, record) = reader.search("date").unwrap().unwrap();
+        assert_eq!(key.user_key, "date");
+        assert_eq!(record, Record::Put(b("brown")));
+
+        // Missing key: bloom filter should reject.
+        assert!(reader.search("fig").unwrap().is_none());
     }
 
     #[test]
