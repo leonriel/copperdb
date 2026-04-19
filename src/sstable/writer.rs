@@ -584,6 +584,57 @@ mod tests {
         }
     }
 
+    /// Files built with `add_entry` + `finish_file` must be readable by
+    /// `SsTableReader::open` and return correct results from `search`.
+    #[test]
+    fn test_finish_file_readable_by_reader() {
+        use crate::sstable::reader::SsTableReader;
+
+        let file = TempFileGuard::new("finish_file_reader.sst");
+        let mut builder = SsTableBuilder::new(file.path_str()).unwrap();
+
+        // Write entries via add_entry (sorted by user_key asc, seq_num desc).
+        builder.add_entry("apple",  &Record::Put(b("red")),    10).unwrap();
+        builder.add_entry("apple",  &Record::Put(b("green")),   5).unwrap();
+        builder.add_entry("banana", &Record::Put(b("yellow")),  8).unwrap();
+        builder.add_entry("cherry", &Record::Delete,             3).unwrap();
+        builder.add_entry("date",   &Record::Put(b("brown")),   1).unwrap();
+
+        let key_range = builder.finish_file().unwrap();
+        assert_eq!(
+            key_range,
+            Some(("apple".to_string(), "date".to_string())),
+            "finish_file should return the correct key range",
+        );
+
+        // The file must be openable by SsTableReader.
+        let mut reader = SsTableReader::open(file.path_str()).unwrap();
+
+        // Put: returns the newest version.
+        let (key, record) = reader.search("apple").unwrap().unwrap();
+        assert_eq!(key.user_key, "apple");
+        assert_eq!(key.seq_num, 10);
+        assert_eq!(record, Record::Put(b("red")));
+
+        // Put: single version.
+        let (key, record) = reader.search("banana").unwrap().unwrap();
+        assert_eq!(key.user_key, "banana");
+        assert_eq!(record, Record::Put(b("yellow")));
+
+        // Delete tombstone.
+        let (key, record) = reader.search("cherry").unwrap().unwrap();
+        assert_eq!(key.user_key, "cherry");
+        assert!(matches!(record, Record::Delete));
+
+        // Last key.
+        let (key, record) = reader.search("date").unwrap().unwrap();
+        assert_eq!(key.user_key, "date");
+        assert_eq!(record, Record::Put(b("brown")));
+
+        // Missing key: bloom filter should reject.
+        assert!(reader.search("fig").unwrap().is_none());
+    }
+
     #[test]
     fn test_builder_oversized_block_creation() {
         let file = TempFileGuard::new("writer_oversized_block.sst");
