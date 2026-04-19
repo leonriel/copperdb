@@ -1,5 +1,8 @@
 use std::cmp;
 
+pub mod storage;
+pub use storage::{EngineError, StorageEngine};
+
 #[derive(thiserror::Error, Debug)]
 pub enum CoreError {
     #[error("Corrupt data: {0}")]

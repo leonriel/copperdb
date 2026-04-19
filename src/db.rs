@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
-use crate::core::Record;
+use async_trait::async_trait;
+
+use crate::core::{EngineError, Record, StorageEngine};
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
 use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
@@ -324,6 +326,48 @@ impl LsmEngine {
         self.flush_tx.send(()).ok();
 
         Ok(())
+    }
+}
+
+/// Tokio-safe async adapter around `LsmEngine`.
+///
+/// Each call offloads to the blocking pool so a slow WAL fsync or SSTable
+/// read can't stall a runtime worker. Implemented on a wrapper (not on
+/// `LsmEngine` directly) because the blocking worker needs an owned `Arc`
+/// handle, which a `&self` borrow can't reconstruct.
+pub struct LsmHandle {
+    inner: Arc<LsmEngine>,
+}
+
+impl LsmHandle {
+    pub fn new(inner: Arc<LsmEngine>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+#[async_trait]
+impl StorageEngine for LsmHandle {
+    async fn put(&self, key: String, value: Vec<u8>) -> Result<(), EngineError> {
+        let engine = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || engine.put(key, value))
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(EngineError::from)
+    }
+
+    async fn get(&self, key: String) -> Result<Option<Vec<u8>>, EngineError> {
+        let engine = Arc::clone(&self.inner);
+        Ok(tokio::task::spawn_blocking(move || engine.get(&key))
+            .await
+            .expect("spawn_blocking panicked"))
+    }
+
+    async fn delete(&self, key: String) -> Result<(), EngineError> {
+        let engine = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || engine.delete(key))
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(EngineError::from)
     }
 }
 
