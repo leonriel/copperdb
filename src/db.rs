@@ -83,7 +83,7 @@ impl LsmEngine {
             next_seq:     AtomicU64::new(max_seq + 1),
             next_wal_gen: AtomicU64::new(next_gen + 1),
             data_dir:     dir.to_path_buf(),
-            version:      SharedVersion::new(),
+            version:      SharedVersion::from_state(version_state),
             compact_tx,
             manifest:     Mutex::new(manifest),
             next_sst_id:  AtomicU64::new(next_sst_id),
@@ -485,6 +485,58 @@ mod tests {
     }
 
     // --- record_compaction() ---
+
+    /// Data flushed to SSTables must be readable after a restart.
+    ///
+    /// Reproduces a bug where `LsmEngine::open` called `SharedVersion::new()`
+    /// (an empty version) instead of seeding it with the `VersionState`
+    /// replayed from the manifest. Without the fix, the reopened engine has
+    /// no knowledge of on-disk SSTables and `get()` returns `None` for keys
+    /// that only exist on disk.
+    #[test]
+    fn get_reads_sstable_data_after_restart() {
+        const TEST_MEMTABLE_SIZE: usize = 32 * 1024; // 32 KB
+
+        let dir = tmp_dir();
+
+        // Phase 1: write data, let the flusher persist it to an SSTable.
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TEST_MEMTABLE_SIZE).unwrap();
+
+            // Write enough to trigger at least one flush.
+            for i in 0u64..100 {
+                let key = format!("sst_key_{:04}", i);
+                let val = vec![i as u8; 512];
+                engine.put(key, val).unwrap();
+            }
+
+            // Give the background flusher time to write the SSTable.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        // Sanity check: at least one SSTable was created.
+        let sst_count = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+            .count();
+        assert!(sst_count > 0, "Expected at least one .sst file after flush");
+
+        // Phase 2: reopen and verify data is readable from SSTables.
+        let engine = LsmEngine::open_with_memtable_size(&dir, TEST_MEMTABLE_SIZE).unwrap();
+
+        // Some keys may also be replayed from WAL into the memtable, but at
+        // least the early keys (whose WAL was deleted after flush) can only
+        // come from SSTables. Check all of them.
+        for i in 0u64..100 {
+            let key = format!("sst_key_{:04}", i);
+            assert_eq!(
+                engine.get(&key),
+                Some(vec![i as u8; 512]),
+                "key {key} missing after restart — manifest replay likely not loaded into SharedVersion",
+            );
+        }
+    }
 
     #[test]
     fn record_compaction_removes_inputs_and_registers_outputs() {
