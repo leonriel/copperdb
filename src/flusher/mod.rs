@@ -72,10 +72,26 @@ fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
         // The immutable table's ID equals the WAL generation number it was
         // paired with (assigned in LsmEngine::rotate_wal_and_memtable).
         // Deleting the WAL is safe now that every record is on disk.
-        let wal = wal_path(&engine.data_dir, table.id());
-        if let Err(e) = std::fs::remove_file(&wal) {
-            // Non-fatal: the WAL is redundant, not missing it is fine.
-            eprintln!("[flusher] could not delete WAL {:?}: {}", wal, e);
+        // Delete this WAL and any older stale WALs (e.g. from recovery).                                                                                                            
+        let flushed_gen = table.id();                                                                                                                                                
+        if let Ok(entries) = std::fs::read_dir(&engine.data_dir) {                                                                                                                   
+            for entry in entries.flatten() {                                                                                                                                         
+                let path = entry.path();                                                                                                                                             
+                if path.extension().and_then(|s| s.to_str()) != Some("wal") {                                                                                                        
+                    continue;                                                                                                                                                        
+                }
+                let maybe_gen = path.file_stem()                                                                                                                                           
+                    .and_then(|s| s.to_str())                                                                                                                                        
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let Some(generation) = maybe_gen {                                                                                                                                               
+                    if generation <= flushed_gen {                                                                                                                                            
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            // Non-fatal: the WAL is redundant, not missing it is fine.
+                            eprintln!("[flusher] could not delete WAL {:?}: {}", path, e);
+                        }
+                    }                                                                                                                                                                
+                }       
+            }
         }
     }
 }
@@ -157,5 +173,70 @@ mod tests {
         assert!(sst_count > 0, "Expected at least one .sst file");
         // There should be at most one WAL left (the active one for the current memtable).
         assert!(wal_count <= 1, "Flushed WAL files should have been deleted, found {}", wal_count);
+    }
+
+    /// WAL files left over from a previous boot must be cleaned up when the
+    /// recovery memtable is eventually flushed.
+    ///
+    /// Scenario: boot → write → crash (drop engine without flushing) → reboot
+    /// → the old WAL is replayed into a new memtable with a higher generation.
+    /// When that memtable is flushed, the stale WAL from the first boot must
+    /// also be deleted.
+    #[test]
+    fn stale_wals_from_prior_boot_are_deleted() {
+        const TEST_MEMTABLE_SIZE: usize = 200 * 1024;
+
+        let dir = tmp_dir();
+
+        // First boot: write some data but do NOT trigger a flush.
+        // This leaves a WAL on disk that will be replayed on the next boot.
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TEST_MEMTABLE_SIZE).unwrap();
+            for i in 0u64..10 {
+                engine.put(format!("old_{:04}", i), vec![i as u8; 100]).unwrap();
+            }
+            // Drop without flushing — WAL survives.
+        }
+
+        let pre_reboot_wals: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+            .map(|e| e.path())
+            .collect();
+        assert!(!pre_reboot_wals.is_empty(), "Expected at least one WAL from the first boot");
+
+        // Second boot: the old WAL is replayed into a memtable with a new,
+        // higher generation. Write enough to trigger a flush.
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TEST_MEMTABLE_SIZE).unwrap();
+            for i in 0u64..256 {
+                engine.put(format!("new_{:06}", i), vec![i as u8; 1000]).unwrap();
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+
+            // After the flush, all old WALs should be gone.
+            let wal_count = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+                .count();
+
+            assert!(
+                wal_count <= 1,
+                "Stale WALs from prior boot should have been deleted, found {}",
+                wal_count,
+            );
+
+            // The old WAL files specifically should no longer exist.
+            for old_wal in &pre_reboot_wals {
+                assert!(
+                    !old_wal.exists(),
+                    "Stale WAL {:?} was not cleaned up",
+                    old_wal,
+                );
+            }
+        }
     }
 }
