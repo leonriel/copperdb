@@ -340,8 +340,8 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("copperdb_server_e2e_{}_{}", std::process::id(), id));
 
-        let lsm = crate::db::LsmEngine::open(&dir).unwrap();
-        let handle: Arc<dyn StorageEngine> = crate::db::LsmHandle::new(lsm);
+        let lsm = crate::engine::LsmEngine::open(&dir).unwrap();
+        let handle: Arc<dyn StorageEngine> = crate::engine::LsmHandle::new(lsm);
         let app = build_router(handle);
 
         app.clone()

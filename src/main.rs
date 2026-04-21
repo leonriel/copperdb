@@ -1,5 +1,5 @@
 mod core;
-mod db;
+mod engine;
 mod memtable;
 mod sstable;
 mod wal;
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::StorageEngine;
-use crate::db::{LsmEngine, LsmHandle};
+use crate::engine::{LsmEngine, LsmHandle};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

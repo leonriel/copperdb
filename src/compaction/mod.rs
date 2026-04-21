@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::sync::mpsc::Receiver;
 
 use crate::core::{InternalKey, KvIterator, Record};
-use crate::db::LsmEngine;
+use crate::engine::LsmEngine;
 use crate::manifest::{SstableMetadata, VersionState, sst_path};
 use crate::sstable::block::Block;
 use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER, META_OFFSET_SIZE};
