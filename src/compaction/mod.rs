@@ -455,14 +455,14 @@ fn is_bottommost_level(version: &VersionState, level: usize) -> bool {
 
 /// Drive the K-way merge from `iter` and write output into one or more new
 /// SSTable files at `output_level`. Returns
-/// `(level, file_id, smallest_key, largest_key)` for every new file.
+/// `(level, file_id, smallest_key, largest_key, max_seq)` for every new file.
 fn merge_and_write(
     engine: &Arc<LsmEngine>,
     mut iter: MergingIterator,
     output_level: u8,
     drop_tombstones: bool,
-) -> Result<Vec<(u8, u64, String, String)>, CompactionError> {
-    let mut output_files: Vec<(u8, u64, String, String)> = Vec::new();
+) -> Result<Vec<(u8, u64, String, String, u64)>, CompactionError> {
+    let mut output_files: Vec<(u8, u64, String, String, u64)> = Vec::new();
     let mut current_writer: Option<(SsTableBuilder, u64)> = None;
     let mut last_user_key: Option<String> = None;
 
@@ -488,11 +488,11 @@ fn merge_and_write(
             .map_or(false, |(w, _)| w.current_size() >= MAX_OUTPUT_FILE_SIZE)
         {
             if let Some((writer, file_id)) = current_writer.take() {
-                if let Some((lo, hi)) = writer
+                if let Some((lo, hi, max_seq)) = writer
                     .finish_file()
                     .map_err(|e| CompactionError::SSTable(e.to_string()))?
                 {
-                    output_files.push((output_level, file_id, lo, hi));
+                    output_files.push((output_level, file_id, lo, hi, max_seq));
                 }
             }
         }
@@ -521,11 +521,11 @@ fn merge_and_write(
 
     // Finalize the last output file.
     if let Some((writer, file_id)) = current_writer {
-        if let Some((lo, hi)) = writer
+        if let Some((lo, hi, max_seq)) = writer
             .finish_file()
             .map_err(|e| CompactionError::SSTable(e.to_string()))?
         {
-            output_files.push((output_level, file_id, lo, hi));
+            output_files.push((output_level, file_id, lo, hi, max_seq));
         }
     }
 

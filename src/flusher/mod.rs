@@ -57,12 +57,12 @@ fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
             return;
         }
 
-        let Some((smallest_key, largest_key)) = builder.key_range() else {
+        let Some((smallest_key, largest_key, max_seq)) = builder.summary() else {
             eprintln!("[flusher] SSTable {:?} has no keys after build; skipping", path);
             return;
         };
 
-        if let Err(e) = engine.record_flush(file_id, smallest_key, largest_key) {
+        if let Err(e) = engine.record_flush(file_id, smallest_key, largest_key, max_seq) {
             eprintln!("[flusher] failed to record flush in manifest for {:?}: {}", path, e);
             return;
         }
