@@ -66,6 +66,12 @@ pub struct SstableMetadata {
     pub level:        Level,
     pub smallest_key: String,
     pub largest_key:  String,
+    /// Highest seq_num of any entry in this SSTable. Persisted so the engine
+    /// can restore `next_seq` correctly across restarts — otherwise new writes
+    /// would get seq numbers lower than records already on disk, and the
+    /// highest-seq-wins compaction dedup would drop newer writes in favour of
+    /// older SSTable records.
+    pub max_seq:      u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +81,7 @@ pub enum VersionEdit {
         file_id:      FileId,
         smallest_key: String,
         largest_key:  String,
+        max_seq:      u64,
     },
     RemoveFile {
         level:   Level,
@@ -100,7 +107,7 @@ impl VersionState {
 
     pub fn apply(&mut self, edit: &VersionEdit) {
         match edit {
-            VersionEdit::AddFile { level, file_id, smallest_key, largest_key } => {
+            VersionEdit::AddFile { level, file_id, smallest_key, largest_key, max_seq } => {
                 let level = *level as usize;
                 if level >= self.levels.len() {
                     self.levels.resize(level + 1, Vec::new());
@@ -110,6 +117,7 @@ impl VersionState {
                     level:        level as u8,
                     smallest_key: smallest_key.clone(),
                     largest_key:  largest_key.clone(),
+                    max_seq:      *max_seq,
                 };
                 if level == 0 {
                     // L0 files may have overlapping key ranges; preserve flush
@@ -142,6 +150,19 @@ impl VersionState {
     /// the next SSTable ID: `all_file_ids().max().unwrap_or(0) + 1`.
     pub fn all_file_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.levels.iter().flatten().map(|m| m.file_id)
+    }
+
+    /// Highest seq_num across every live SSTable. Used at startup to initialise
+    /// `LsmEngine::next_seq` so new writes never collide with seqs already on
+    /// disk; if they did, compaction's highest-seq-wins dedup could drop the
+    /// new writes in favour of stale records.
+    pub fn max_seq_num(&self) -> u64 {
+        self.levels
+            .iter()
+            .flatten()
+            .map(|m| m.max_seq)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns metadata for every file at `level` whose key range overlaps
@@ -251,18 +272,20 @@ impl Manifest {
 ///   [type: 1B=0x01][file_id: 8B][level: 1B]
 ///   [smallest_key_len: 4B][smallest_key: N]
 ///   [largest_key_len:  4B][largest_key:  M]
+///   [max_seq: 8B]
 ///
 /// RemoveFile layout (big-endian):
 ///   [type: 1B=0x02][file_id: 8B][level: 1B]
 fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
     match edit {
-        VersionEdit::AddFile { level, file_id, smallest_key, largest_key } => {
+        VersionEdit::AddFile { level, file_id, smallest_key, largest_key, max_seq } => {
             let sk = smallest_key.as_bytes();
             let lk = largest_key.as_bytes();
             let mut buf = Vec::with_capacity(
                 EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE +
                 KEY_LEN_SIZE + sk.len() +
-                KEY_LEN_SIZE + lk.len(),
+                KEY_LEN_SIZE + lk.len() +
+                size_of::<u64>(),
             );
             buf.push(EditType::AddFile as u8);
             buf.extend_from_slice(&file_id.to_be_bytes());
@@ -271,6 +294,7 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
             buf.extend_from_slice(sk);
             buf.extend_from_slice(&(lk.len() as u32).to_be_bytes());
             buf.extend_from_slice(lk);
+            buf.extend_from_slice(&max_seq.to_be_bytes());
             buf
         }
         VersionEdit::RemoveFile { level, file_id } => {
@@ -326,7 +350,7 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
 
         let edit = match edit_type {
             EditType::AddFile => {
-                // smallest_key_len (4B) + smallest_key + largest_key_len (4B) + largest_key
+                // smallest_key_len (4B) + smallest_key + largest_key_len (4B) + largest_key + max_seq (8B)
                 let mut sk_len_buf = [0u8; KEY_LEN_SIZE];
                 if reader.read_exact(&mut sk_len_buf).is_err() { break; }
                 let sk_len = u32::from_be_bytes(sk_len_buf) as usize;
@@ -341,10 +365,14 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
                 let mut lk_buf = vec![0u8; lk_len];
                 if reader.read_exact(&mut lk_buf).is_err() { break; }
 
+                let mut max_seq_buf = [0u8; size_of::<u64>()];
+                if reader.read_exact(&mut max_seq_buf).is_err() { break; }
+
                 // Verify CRC before accepting the record
                 let mut payload = Vec::with_capacity(
                     EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE +
-                    KEY_LEN_SIZE + sk_len + KEY_LEN_SIZE + lk_len,
+                    KEY_LEN_SIZE + sk_len + KEY_LEN_SIZE + lk_len +
+                    size_of::<u64>(),
                 );
                 payload.push(raw_type);
                 payload.extend_from_slice(&id_level_buf);
@@ -352,6 +380,7 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
                 payload.extend_from_slice(&sk_buf);
                 payload.extend_from_slice(&lk_len_buf);
                 payload.extend_from_slice(&lk_buf);
+                payload.extend_from_slice(&max_seq_buf);
 
                 if !Crc32Checksum::verify(&payload, expected_crc) {
                     break;
@@ -365,8 +394,9 @@ fn replay(path: &Path) -> Result<VersionState, ManifestError> {
                     Ok(s) => s,
                     Err(_) => break,
                 };
+                let max_seq = u64::from_be_bytes(max_seq_buf);
 
-                VersionEdit::AddFile { level, file_id, smallest_key, largest_key }
+                VersionEdit::AddFile { level, file_id, smallest_key, largest_key, max_seq }
             }
             EditType::RemoveFile => {
                 let mut payload = Vec::with_capacity(EDIT_TYPE_SIZE + FILE_ID_SIZE + LEVEL_SIZE);
@@ -413,6 +443,7 @@ mod tests {
             file_id,
             smallest_key: lo.to_string(),
             largest_key:  hi.to_string(),
+            max_seq:      0,
         }
     }
 
@@ -651,6 +682,7 @@ mod tests {
                             file_id,
                             smallest_key: key.clone(),
                             largest_key: key,
+                            max_seq: 0,
                         };
                         let mut guard = version.write().unwrap();
                         let mut new_v = (**guard).clone();
@@ -700,6 +732,7 @@ mod tests {
                         file_id: i as u64,
                         smallest_key: key.clone(),
                         largest_key: key,
+                        max_seq: 0,
                     };
                     let mut guard = version.write().unwrap();
                     let mut new_v = (**guard).clone();
@@ -749,6 +782,7 @@ mod tests {
                         file_id,
                         smallest_key: key.clone(),
                         largest_key: key,
+                        max_seq: 0,
                     };
                     let mut guard = version.write().unwrap();
                     let mut new_v = (**guard).clone();

@@ -10,7 +10,7 @@ use crate::core::{EngineError, Record, StorageEngine};
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
 use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
-use crate::sstable::reader::SsTableReader;
+use crate::sstable::reader::{ReaderError, SsTableReader};
 
 use std::time::Duration;
 
@@ -56,7 +56,7 @@ impl LsmEngine {
 
         let records = recover_all::<Crc32Checksum>(dir)?;
         let next_gen = highest_wal_gen(dir) + 1;
-        let max_seq = records.iter().map(|r| r.seq_num).max().unwrap_or(0);
+        let wal_max_seq = records.iter().map(|r| r.seq_num).max().unwrap_or(0);
 
         let state = MemTableState::new(MAX_IMMUTABLE_TABLES, memtable_size, next_gen);
 
@@ -76,6 +76,11 @@ impl LsmEngine {
         let (manifest, version_state) = Manifest::open_or_create(dir)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let next_sst_id = version_state.all_file_ids().max().unwrap_or(0) + 1;
+        // Seq numbers must strictly exceed anything durably written — both in
+        // surviving WALs and in already-flushed SSTables. Otherwise a restart
+        // with empty WALs but populated SSTables would reset seq to 1, and a
+        // later compaction's highest-seq-wins dedup would keep the old record.
+        let max_seq = std::cmp::max(wal_max_seq, version_state.max_seq_num());
 
         let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
 
@@ -131,6 +136,29 @@ impl LsmEngine {
     ///
     /// Search order: active MemTable → immutable MemTables → L0 SSTables
     /// (newest-first) → L1+ SSTables (binary search per level).
+    ///
+    /// ## SSTable-search retry on ENOENT
+    ///
+    /// The SSTable scan takes a point-in-time snapshot of the version state.
+    /// The compaction worker can swap in a new version and then unlink the
+    /// old files — a reader that still holds the old snapshot will see
+    /// `NotFound` when it tries to open a file whose data has already been
+    /// merged into a successor at a deeper level. The compaction worker
+    /// always applies the version edit **before** calling `remove_file`
+    /// (see `compaction::compact_level`), so a fresh `current_version()`
+    /// after an ENOENT is guaranteed to not reference the missing file —
+    /// retrying the scan with a fresh snapshot recovers the correct answer.
+    ///
+    /// The retry cap is defence-in-depth: if the apply-before-unlink
+    /// invariant is ever broken, we'd rather log and return `None` than
+    /// infinite-loop.
+    ///
+    /// Alternative we considered: give every `SstableMetadata` an
+    /// `Arc<FileHandle>` whose `Drop` impl unlinks the file, so each
+    /// snapshot's strong reference keeps the file alive until no reader
+    /// needs it. More robust (no races, no retry loop), but a larger
+    /// refactor across `VersionState`, the flusher, and the compactor.
+    /// Worth revisiting if this retry ever becomes load-bearing.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         // 1. MemTables: active then immutables, newest first.
         if let Some((record, _)) = self.state.get(key) {
@@ -140,72 +168,84 @@ impl LsmEngine {
             };
         }
 
-        // 2. SSTables via the current version snapshot.
-        // It's possible that a table from self.state gets rotated before
-        // self.current_version() retrieves the current version state. This
-        // means we could read the same table twice. This OK from a correctness
-        // standpoint for point lookups, but costs an extra I/O.
-        let version = self.current_version();
+        const MAX_READ_RETRIES: usize = 16;
 
-        // L0 files may have overlapping key ranges. Scan newest-first (the
-        // Vec is in flush order — oldest at index 0 — so reverse it).
-        for meta in version.files_at_level(0).iter().rev() {
-            // Skip the file entirely if the key is outside its known range.
-            if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
-                continue;
-            }
-            let path = sst_path(&self.data_dir, meta.file_id);
-            let Some(path_str) = path.to_str() else { continue };
-            let mut reader = match SsTableReader::open(path_str) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[db] failed to open L0 SSTable {:?}: {}", path, e);
+        'retry: for _ in 0..MAX_READ_RETRIES {
+            let version = self.current_version();
+
+            // L0 files may have overlapping key ranges. Scan newest-first (the
+            // Vec is in flush order — oldest at index 0 — so reverse it).
+            for meta in version.files_at_level(0).iter().rev() {
+                // Skip the file entirely if the key is outside its known range.
+                if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
                     continue;
                 }
-            };
-            match reader.search(key) {
-                Ok(Some((_, Record::Put(v)))) => return Some(v),
-                Ok(Some((_, Record::Delete))) => return None,
-                Ok(None) => {}
-                Err(e) => eprintln!("[db] error searching L0 SSTable {:?}: {}", path, e),
-            }
-        }
-
-        // L1+ files are non-overlapping and sorted by smallest_key within each
-        // level. Use partition_point to find the one candidate file per level.
-        for level in 1..7usize {
-            let files = version.files_at_level(level);
-            if files.is_empty() {
-                continue;
-            }
-
-            // Find the last file whose smallest_key <= key.
-            let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
-            if pos == 0 {
-                continue; // key precedes every file at this level
-            }
-            let meta = &files[pos - 1];
-            if meta.largest_key.as_str() < key {
-                continue; // key falls in a gap between files
+                let path = sst_path(&self.data_dir, meta.file_id);
+                let Some(path_str) = path.to_str() else { continue };
+                let mut reader = match SsTableReader::open(path_str) {
+                    Ok(r) => r,
+                    Err(ReaderError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                        continue 'retry;
+                    }
+                    Err(e) => {
+                        eprintln!("[db] failed to open L0 SSTable {:?}: {}", path, e);
+                        continue;
+                    }
+                };
+                match reader.search(key) {
+                    Ok(Some((_, Record::Put(v)))) => return Some(v),
+                    Ok(Some((_, Record::Delete))) => return None,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[db] error searching L0 SSTable {:?}: {}", path, e),
+                }
             }
 
-            let path = sst_path(&self.data_dir, meta.file_id);
-            let Some(path_str) = path.to_str() else { continue };
-            let mut reader = match SsTableReader::open(path_str) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[db] failed to open L{} SSTable {:?}: {}", level, path, e);
+            // L1+ files are non-overlapping and sorted by smallest_key within each
+            // level. Use partition_point to find the one candidate file per level.
+            for level in 1..7usize {
+                let files = version.files_at_level(level);
+                if files.is_empty() {
                     continue;
                 }
-            };
-            match reader.search(key) {
-                Ok(Some((_, Record::Put(v)))) => return Some(v),
-                Ok(Some((_, Record::Delete))) => return None,
-                Ok(None) => {}
-                Err(e) => eprintln!("[db] error searching L{} SSTable {:?}: {}", level, path, e),
+
+                // Find the last file whose smallest_key <= key.
+                let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
+                if pos == 0 {
+                    continue; // key precedes every file at this level
+                }
+                let meta = &files[pos - 1];
+                if meta.largest_key.as_str() < key {
+                    continue; // key falls in a gap between files
+                }
+
+                let path = sst_path(&self.data_dir, meta.file_id);
+                let Some(path_str) = path.to_str() else { continue };
+                let mut reader = match SsTableReader::open(path_str) {
+                    Ok(r) => r,
+                    Err(ReaderError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                        continue 'retry;
+                    }
+                    Err(e) => {
+                        eprintln!("[db] failed to open L{} SSTable {:?}: {}", level, path, e);
+                        continue;
+                    }
+                };
+                match reader.search(key) {
+                    Ok(Some((_, Record::Put(v)))) => return Some(v),
+                    Ok(Some((_, Record::Delete))) => return None,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[db] error searching L{} SSTable {:?}: {}", level, path, e),
+                }
             }
+
+            return None;
         }
 
+        eprintln!(
+            "[db] exhausted {} read retries for key {:?}; \
+             version apply-before-unlink invariant may be broken",
+            MAX_READ_RETRIES, key,
+        );
         None
     }
 
@@ -268,8 +308,9 @@ impl LsmEngine {
         file_id: u64,
         smallest_key: String,
         largest_key: String,
+        max_seq: u64,
     ) -> io::Result<()> {
-        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key };
+        let edit = VersionEdit::AddFile { level: 0, file_id, smallest_key, largest_key, max_seq };
 
         self.manifest.lock().unwrap().append(&edit)?;
         self.version.apply(&[edit]);
@@ -284,19 +325,20 @@ impl LsmEngine {
     pub fn record_compaction(
         &self,
         removed: &[(u8, u64)],
-        added: &[(u8, u64, String, String)],
+        added: &[(u8, u64, String, String, u64)],
     ) -> io::Result<()> {
         let mut edits: Vec<VersionEdit> = Vec::with_capacity(removed.len() + added.len());
 
         for &(level, file_id) in removed {
             edits.push(VersionEdit::RemoveFile { level, file_id });
         }
-        for (level, file_id, smallest_key, largest_key) in added {
+        for (level, file_id, smallest_key, largest_key, max_seq) in added {
             edits.push(VersionEdit::AddFile {
                 level:        *level,
                 file_id:      *file_id,
                 smallest_key: smallest_key.clone(),
                 largest_key:  largest_key.clone(),
+                max_seq:      *max_seq,
             });
         }
 
@@ -590,6 +632,71 @@ mod tests {
         }
     }
 
+    /// Regression for bug #2: on restart with existing SSTables but no
+    /// surviving WALs, `next_seq` resets to 1. New writes then get seq numbers
+    /// lower than records already on disk. When compaction merges a new record
+    /// with an older, higher-seq record for the same key, the merger keeps the
+    /// highest-seq entry — so the stale on-disk value wins and the user's
+    /// newer write is silently dropped.
+    #[test]
+    fn seq_does_not_reset_after_restart_with_flushed_data() {
+        const TINY_MEMTABLE: usize = 4 * 1024;
+        let dir = tmp_dir();
+
+        // Session 1: write K with a big value, force a flush so the record
+        // lands in an SSTable with some seq > 0, then drop so the WAL is
+        // deleted and only the SSTable remains on disk.
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+            // Pad first so K gets a HIGH seq number, making the bug deterministic:
+            // session 2's reset-to-seq=1 then loses to session 1's high seq when
+            // compaction merges them (merge keeps the entry with the highest seq
+            // per user_key, regardless of which is actually newer).
+            for i in 0u32..30 {
+                engine.put(format!("pad_{i}"), vec![i as u8; 2048]).unwrap();
+            }
+            engine.put("K".into(), b"session_1".to_vec()).unwrap();
+            for i in 30u32..40 {
+                engine.put(format!("pad_{i}"), vec![i as u8; 2048]).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+        }
+
+        // Confirm preconditions: at least one SST on disk, WAL files all gone.
+        let sst_count = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+            .count();
+        assert!(sst_count > 0, "test setup: expected an SST on disk");
+
+        // Session 2: write a *new* value for K. After the seq reset bug, this
+        // gets a lower seq than the session-1 record already on disk.
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+            engine.put("K".into(), b"session_2".to_vec()).unwrap();
+            // Force enough flushes + compactions to merge K's old and new
+            // entries. L0 trigger is 4 files.
+            for i in 0u32..30 {
+                engine.put(format!("pad2_{i}"), vec![i as u8; 2048]).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert_eq!(
+                engine.get("K").as_deref(),
+                Some(b"session_2".as_slice()),
+                "compaction kept the stale session-1 value: seq reset on restart lost the new write",
+            );
+        }
+
+        // Session 3: reopen once more and re-check, now from pure disk state.
+        let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            engine.get("K").as_deref(),
+            Some(b"session_2".as_slice()),
+            "after final restart, session-2 value must still be readable",
+        );
+    }
+
     #[test]
     fn record_compaction_removes_inputs_and_registers_outputs() {
         let dir = tmp_dir();
@@ -599,8 +706,8 @@ mod tests {
         engine.record_compaction(
             &[],
             &[
-                (0, 1, "a".to_string(), "c".to_string()),
-                (0, 2, "d".to_string(), "f".to_string()),
+                (0, 1, "a".to_string(), "c".to_string(), 0),
+                (0, 2, "d".to_string(), "f".to_string(), 0),
             ],
         ).unwrap();
         assert_eq!(engine.current_version().files_at_level(0).len(), 2);
@@ -608,7 +715,7 @@ mod tests {
         // Compact L0 → L1.
         engine.record_compaction(
             &[(0, 1), (0, 2)],
-            &[(1, 3, "a".to_string(), "f".to_string())],
+            &[(1, 3, "a".to_string(), "f".to_string(), 0)],
         ).unwrap();
 
         let v = engine.current_version();
@@ -624,7 +731,7 @@ mod tests {
         let dir = tmp_dir();
         let engine = LsmEngine::open(&dir).unwrap();
 
-        engine.record_compaction(&[], &[(0, 7, "x".to_string(), "z".to_string())]).unwrap();
+        engine.record_compaction(&[], &[(0, 7, "x".to_string(), "z".to_string(), 0)]).unwrap();
         assert_eq!(engine.current_version().files_at_level(0).len(), 1);
 
         engine.record_compaction(&[(0, 7)], &[]).unwrap();
@@ -639,8 +746,8 @@ mod tests {
         engine.record_compaction(
             &[],
             &[
-                (1, 10, "apple".to_string(), "mango".to_string()),
-                (1, 11, "orange".to_string(), "zebra".to_string()),
+                (1, 10, "apple".to_string(), "mango".to_string(), 0),
+                (1, 11, "orange".to_string(), "zebra".to_string(), 0),
             ],
         ).unwrap();
 
@@ -679,16 +786,16 @@ mod tests {
         engine.record_compaction(
             &[],
             &[
-                (0, 1, "a".to_string(), "b".to_string()),
-                (1, 2, "c".to_string(), "d".to_string()),
-                (2, 3, "e".to_string(), "f".to_string()),
+                (0, 1, "a".to_string(), "b".to_string(), 0),
+                (1, 2, "c".to_string(), "d".to_string(), 0),
+                (2, 3, "e".to_string(), "f".to_string(), 0),
             ],
         ).unwrap();
 
         // Compact L1 file into L2.
         engine.record_compaction(
             &[(1, 2)],
-            &[(2, 4, "c".to_string(), "f".to_string())],
+            &[(2, 4, "c".to_string(), "f".to_string(), 0)],
         ).unwrap();
 
         let v = engine.current_version();
@@ -714,7 +821,7 @@ mod tests {
         // Seed an initial file so the compaction thread has something to remove.
         engine.record_compaction(
             &[],
-            &[(0, 1000, "key_0000".to_string(), "key_0099".to_string())],
+            &[(0, 1000, "key_0000".to_string(), "key_0099".to_string(), 0)],
         ).unwrap();
 
         let e1 = Arc::clone(&engine);
@@ -723,11 +830,11 @@ mod tests {
                 // Alternate between adding and then removing the same file.
                 e1.record_compaction(
                     &[(0, 1000)],
-                    &[(1, 2000 + id, "key_0000".to_string(), "key_0099".to_string())],
+                    &[(1, 2000 + id, "key_0000".to_string(), "key_0099".to_string(), 0)],
                 ).ok();
                 e1.record_compaction(
                     &[(1, 2000 + id)],
-                    &[(0, 1000, "key_0000".to_string(), "key_0099".to_string())],
+                    &[(0, 1000, "key_0000".to_string(), "key_0099".to_string(), 0)],
                 ).ok();
             }
         });
@@ -792,6 +899,7 @@ mod tests {
                             file_id,
                             format!("k{:04}", offset),
                             format!("k{:04}", offset + 9),
+                            0,
                         )],
                     ).unwrap();
                 }

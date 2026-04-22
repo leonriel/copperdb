@@ -49,6 +49,10 @@ pub struct SsTableBuilder {
     smallest_key: Option<String>,
     /// Last user_key written — updated on every entry; holds the largest after build.
     largest_key: Option<String>,
+    /// Highest seq_num seen across every entry. Needed on engine reopen so
+    /// `next_seq` can exceed every durable record — otherwise new writes get
+    /// seq numbers lower than SSTable records and lose compaction dedup.
+    max_seq_num: u64,
 }
 
 impl SsTableBuilder {
@@ -65,15 +69,16 @@ impl SsTableBuilder {
             bloom,
             smallest_key: None,
             largest_key: None,
+            max_seq_num: 0,
         })
     }
 
-    /// Returns the inclusive key range `(smallest, largest)` of all entries
-    /// written to this SSTable. Returns `None` if the iterator was empty.
-    /// Must be called after `build_from_iterator`.
-    pub fn key_range(self) -> Option<(String, String)> {
+    /// Returns the inclusive key range `(smallest, largest)` and the highest
+    /// seq_num of all entries written to this SSTable. Returns `None` if the
+    /// iterator was empty. Must be called after `build_from_iterator`.
+    pub fn summary(self) -> Option<(String, String, u64)> {
         match (self.smallest_key, self.largest_key) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
+            (Some(lo), Some(hi)) => Some((lo, hi, self.max_seq_num)),
             _ => None,
         }
     }
@@ -112,6 +117,9 @@ impl SsTableBuilder {
                 self.smallest_key = Some(user_key.clone());
             }
             self.largest_key = Some(user_key.clone());
+            if seq_num > self.max_seq_num {
+                self.max_seq_num = seq_num;
+            }
 
             // If this is the first entry in a block, save it for the index
             if self.first_key_of_current_block.is_none() {
@@ -198,6 +206,9 @@ impl SsTableBuilder {
             self.smallest_key = Some(user_key.to_string());
         }
         self.largest_key = Some(user_key.to_string());
+        if seq_num > self.max_seq_num {
+            self.max_seq_num = seq_num;
+        }
 
         if self.first_key_of_current_block.is_none() {
             self.first_key_of_current_block = Some(user_key.to_string());
@@ -215,9 +226,9 @@ impl SsTableBuilder {
 
     /// Flush remaining buffered data, write the meta block (bloom filter),
     /// index block, and footer, then sync. Returns
-    /// `Some((smallest_key, largest_key))` if any entries were written, or
-    /// `None` for an empty file.
-    pub fn finish_file(mut self) -> Result<Option<(String, String)>, WriterError> {
+    /// `Some((smallest_key, largest_key, max_seq_num))` if any entries were
+    /// written, or `None` for an empty file.
+    pub fn finish_file(mut self) -> Result<Option<(String, String, u64)>, WriterError> {
         if !self.current_block.is_empty() {
             self.finish_current_block()?;
         }
@@ -260,7 +271,7 @@ impl SsTableBuilder {
         self.file.sync_all()?;
 
         Ok(match (self.smallest_key, self.largest_key) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
+            (Some(lo), Some(hi)) => Some((lo, hi, self.max_seq_num)),
             _ => None,
         })
     }
@@ -600,11 +611,11 @@ mod tests {
         builder.add_entry("cherry", &Record::Delete,             3).unwrap();
         builder.add_entry("date",   &Record::Put(b("brown")),   1).unwrap();
 
-        let key_range = builder.finish_file().unwrap();
+        let summary = builder.finish_file().unwrap();
         assert_eq!(
-            key_range,
-            Some(("apple".to_string(), "date".to_string())),
-            "finish_file should return the correct key range",
+            summary,
+            Some(("apple".to_string(), "date".to_string(), 10)),
+            "finish_file should return the correct key range and max seq_num",
         );
 
         // The file must be openable by SsTableReader.
