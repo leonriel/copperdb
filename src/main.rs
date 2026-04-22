@@ -8,6 +8,9 @@ mod manifest;
 mod flusher;
 mod server;
 
+#[cfg(test)]
+mod property_tests;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
