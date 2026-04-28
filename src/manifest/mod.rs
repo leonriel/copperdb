@@ -410,14 +410,6 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
     }
 }
 
-/// Read all intact records from the MANIFEST file and build a `VersionState`.
-///
-/// Stops at the first CRC mismatch without returning an error — that record
-/// represents a partial write interrupted by a crash.
-///
-/// Returns `Err(ManifestError::UnknownEditType)` if a record passes its CRC
-/// check but carries an unrecognised edit type. This is distinct from a torn
-/// write and indicates genuine corruption or a version mismatch.
 /// Remove every `.sst` file in `dir` whose file id isn't tracked by `state`.
 ///
 /// Targets crash-window orphans: the previous session wrote the SSTable to
@@ -462,6 +454,14 @@ fn sweep_orphans(dir: &Path, state: &VersionState) -> io::Result<()> {
     Ok(())
 }
 
+/// Read all intact records from the MANIFEST file and build a `VersionState`.
+///
+/// Stops at the first CRC mismatch without returning an error — that record
+/// represents a partial write interrupted by a crash.
+///
+/// Returns `Err(ManifestError::UnknownEditType)` if a record passes its CRC
+/// check but carries an unrecognised edit type. This is distinct from a torn
+/// write and indicates genuine corruption or a version mismatch.
 fn replay(path: &Path, dir: &Path) -> Result<VersionState, ManifestError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
