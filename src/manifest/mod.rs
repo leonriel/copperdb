@@ -1039,4 +1039,89 @@ mod tests {
             "A reader observed a partial compaction state"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SstFileGuard unlink behaviour
+    // -----------------------------------------------------------------------
+
+    /// An unmarked guard must leave its file on disk when dropped. This is
+    /// what protects files referenced by the live `VersionState` from being
+    /// destroyed at engine shutdown.
+    #[test]
+    fn unmarked_guard_does_not_unlink_on_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 1;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+        assert!(path.exists(), "test setup: file should exist before drop");
+
+        {
+            let _guard = SstFileGuard::new(file_id, &dir);
+            // Default `should_unlink` is false; no `mark_for_deletion`.
+        }
+
+        assert!(
+            path.exists(),
+            "an unmarked guard must not unlink its underlying file on drop",
+        );
+    }
+
+    /// A guard whose `should_unlink` flag has been set must unlink its file
+    /// when the last `Arc` to it drops.
+    #[test]
+    fn marked_guard_unlinks_on_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 2;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+        assert!(path.exists(), "test setup: file should exist before drop");
+
+        {
+            let guard = SstFileGuard::new(file_id, &dir);
+            guard.mark_for_deletion();
+        }
+
+        assert!(
+            !path.exists(),
+            "a marked guard must unlink its underlying file on drop",
+        );
+    }
+
+    /// `mark_for_deletion` is called on an `&SstFileGuard` reached via one
+    /// Arc clone; the inner `AtomicBool` is shared, so any other Arc clone
+    /// observes the mark when its turn to drop comes. This is the contract
+    /// that lets `apply(RemoveFile)` mark a guard while older snapshots are
+    /// still pinning the file: the unlink is deferred until the last
+    /// snapshot releases its clone, at which point Drop sees the mark and
+    /// unlinks.
+    #[test]
+    fn mark_propagates_across_arc_clones_and_unlinks_on_last_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 3;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+
+        let g1 = Arc::new(SstFileGuard::new(file_id, &dir));
+        let g2 = Arc::clone(&g1);
+
+        // Mark via g1; g2 must observe the same mark.
+        g1.mark_for_deletion();
+
+        // Dropping g1 must NOT unlink — g2 still pins the guard.
+        drop(g1);
+        assert!(
+            path.exists(),
+            "file should still exist while another Arc clone is alive",
+        );
+
+        // Dropping the last reference fires Drop, which sees the mark and unlinks.
+        drop(g2);
+        assert!(
+            !path.exists(),
+            "file should be unlinked once the last marked Arc clone drops",
+        );
+    }
 }
