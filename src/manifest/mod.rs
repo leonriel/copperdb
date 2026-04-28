@@ -60,6 +60,46 @@ pub fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Refcounted handle to an on-disk SSTable file. Phase 1 of the read/compaction
+/// race fix: every `SstableMetadata` carries an `Arc<SstFileGuard>` so future
+/// work can hang an unlink-on-last-drop behaviour off this type without further
+/// plumbing changes.
+///
+/// Phase 1 keeps the existing system intact — `Drop` is a no-op, the compaction
+/// worker still calls `std::fs::remove_file` directly, and `engine::get` still
+/// retries on ENOENT. Phase 2 will give this type a `Drop` impl that unlinks
+/// the file, delete the explicit `remove_file` calls in the compactor, and
+/// remove the read-path retry loop in one go.
+pub struct SstFileGuard {
+    pub file_id: FileId,
+    /// Used by phase 2's `Drop` impl; allow dead_code in the meantime.
+    #[allow(dead_code)]
+    pub path:    PathBuf,
+}
+
+impl SstFileGuard {
+    pub(crate) fn new(file_id: FileId, dir: &Path) -> Self {
+        Self { file_id, path: sst_path(dir, file_id) }
+    }
+}
+
+impl std::fmt::Debug for SstFileGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstFileGuard")
+            .field("file_id", &self.file_id)
+            .finish()
+    }
+}
+
+/// Two guards are equal iff they refer to the same file id. This lets
+/// `SstableMetadata` keep its derived `PartialEq` without comparing pointer
+/// identity of the `Arc`.
+impl PartialEq for SstFileGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_id == other.file_id
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SstableMetadata {
     pub file_id:      FileId,
@@ -72,6 +112,11 @@ pub struct SstableMetadata {
     /// highest-seq-wins compaction dedup would drop newer writes in favour of
     /// older SSTable records.
     pub max_seq:      u64,
+    /// Refcounted handle that keeps the on-disk file alive for as long as any
+    /// snapshot references this metadata. Cloning `SstableMetadata` clones the
+    /// `Arc`, so every snapshot returned by `SharedVersion::snapshot()`
+    /// automatically pins its files.
+    pub file:         Arc<SstFileGuard>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,12 +141,17 @@ pub enum VersionEdit {
 #[derive(Clone, Debug)]
 pub struct VersionState {
     levels: Vec<Vec<SstableMetadata>>,
+    /// Directory holding all SSTable files. Stored so `apply` can mint an
+    /// `SstFileGuard` for each new file without the caller having to thread
+    /// the path through every edit.
+    data_dir: PathBuf,
 }
 
 impl VersionState {
-    pub fn new() -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             levels: vec![Vec::new(); NUM_LEVELS],
+            data_dir,
         }
     }
 
@@ -118,6 +168,7 @@ impl VersionState {
                     smallest_key: smallest_key.clone(),
                     largest_key:  largest_key.clone(),
                     max_seq:      *max_seq,
+                    file:         Arc::new(SstFileGuard::new(*file_id, &self.data_dir)),
                 };
                 if level == 0 {
                     // L0 files may have overlapping key ranges; preserve flush
@@ -192,10 +243,6 @@ impl VersionState {
 pub struct SharedVersion(RwLock<Arc<VersionState>>);
 
 impl SharedVersion {
-    pub fn new() -> Self {
-        Self(RwLock::new(Arc::new(VersionState::new())))
-    }
-
     /// Create a `SharedVersion` pre-loaded with a replayed `VersionState`.
     /// Used during engine recovery to restore the manifest state from disk.
     pub fn from_state(state: VersionState) -> Self {
@@ -237,9 +284,9 @@ impl Manifest {
         let path = manifest_path(dir);
 
         let version = if path.exists() {
-            replay(&path)?
+            replay(&path, dir)?
         } else {
-            VersionState::new()
+            VersionState::new(dir.to_path_buf())
         };
 
         let file = OpenOptions::new()
@@ -315,10 +362,10 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
 /// Returns `Err(ManifestError::UnknownEditType)` if a record passes its CRC
 /// check but carries an unrecognised edit type. This is distinct from a torn
 /// write and indicates genuine corruption or a version mismatch.
-fn replay(path: &Path) -> Result<VersionState, ManifestError> {
+fn replay(path: &Path, dir: &Path) -> Result<VersionState, ManifestError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut state = VersionState::new();
+    let mut state = VersionState::new(dir.to_path_buf());
     let mut byte_offset: u64 = 0;
 
     loop {
@@ -579,7 +626,7 @@ mod tests {
 
     #[test]
     fn overlapping_files_correct_range() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(1, 1, "apple",  "cherry"));  // [apple,  cherry]
         state.apply(&add(2, 1, "date",   "grape"));   // [date,   grape]
         state.apply(&add(3, 1, "mango",  "peach"));   // [mango,  peach]
@@ -604,7 +651,7 @@ mod tests {
     // Without the sorted-insert fix, files_at_level(1) would return [mango, date, apple].
     #[test]
     fn l1_files_sorted_after_out_of_order_apply() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(3, 1, "mango", "peach"));
         state.apply(&add(1, 1, "apple", "cherry"));
         state.apply(&add(2, 1, "date",  "grape"));
@@ -637,7 +684,7 @@ mod tests {
     // visits newest-first), not sort by key.
     #[test]
     fn l0_files_preserve_insertion_order() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(1, 0, "mango", "peach"));
         state.apply(&add(2, 0, "apple", "cherry"));
         state.apply(&add(3, 0, "date",  "grape"));
@@ -665,7 +712,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         const N_THREADS: usize = 8;
         const FILES_PER_THREAD: usize = 10;
@@ -708,7 +755,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Seed one file before taking the snapshot.
         {
@@ -763,7 +810,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Each tuple is (file_id, key). Deliberately not in key order.
         let files: &[(u64, &str)] = &[
@@ -819,7 +866,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Seed two L1 files that compaction will replace.
         {
