@@ -12,7 +12,7 @@ use crate::core::{EngineError, Record, StorageEngine};
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
 use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
-use crate::sstable::reader::{ReaderError, SsTableReader};
+use crate::sstable::reader::SsTableReader;
 
 use std::time::Duration;
 
@@ -201,28 +201,13 @@ impl EngineCore {
     /// Search order: active MemTable → immutable MemTables → L0 SSTables
     /// (newest-first) → L1+ SSTables (binary search per level).
     ///
-    /// ## SSTable-search retry on ENOENT
-    ///
-    /// The SSTable scan takes a point-in-time snapshot of the version state.
-    /// The compaction worker can swap in a new version and then unlink the
-    /// old files — a reader that still holds the old snapshot will see
-    /// `NotFound` when it tries to open a file whose data has already been
-    /// merged into a successor at a deeper level. The compaction worker
-    /// always applies the version edit **before** calling `remove_file`
-    /// (see `compaction::compact_level`), so a fresh `current_version()`
-    /// after an ENOENT is guaranteed to not reference the missing file —
-    /// retrying the scan with a fresh snapshot recovers the correct answer.
-    ///
-    /// The retry cap is defence-in-depth: if the apply-before-unlink
-    /// invariant is ever broken, we'd rather log and return `None` than
-    /// infinite-loop.
-    ///
-    /// Alternative we considered: give every `SstableMetadata` an
-    /// `Arc<FileHandle>` whose `Drop` impl unlinks the file, so each
-    /// snapshot's strong reference keeps the file alive until no reader
-    /// needs it. More robust (no races, no retry loop), but a larger
-    /// refactor across `VersionState`, the flusher, and the compactor.
-    /// Worth revisiting if this retry ever becomes load-bearing.
+    /// The `Arc<VersionState>` snapshot returned by `current_version()` clones
+    /// the `Arc<SstFileGuard>` of every metadata it references, so each file
+    /// the scan could open is pinned for the duration of this call. Compaction
+    /// running concurrently can mark a guard for deletion, but the actual
+    /// `remove_file` is deferred until the last clone drops — which can't
+    /// happen while we hold the snapshot. ENOENT during this scan therefore
+    /// indicates a real bug, not a benign race.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         // 1. MemTables: active then immutables, newest first.
         if let Some((record, _)) = self.state.get(key) {
@@ -232,84 +217,67 @@ impl EngineCore {
             };
         }
 
-        const MAX_READ_RETRIES: usize = 16;
+        let version = self.current_version();
 
-        'retry: for _ in 0..MAX_READ_RETRIES {
-            let version = self.current_version();
-
-            // L0 files may have overlapping key ranges. Scan newest-first (the
-            // Vec is in flush order — oldest at index 0 — so reverse it).
-            for meta in version.files_at_level(0).iter().rev() {
-                // Skip the file entirely if the key is outside its known range.
-                if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
+        // L0 files may have overlapping key ranges. Scan newest-first (the
+        // Vec is in flush order — oldest at index 0 — so reverse it).
+        for meta in version.files_at_level(0).iter().rev() {
+            // Skip the file entirely if the key is outside its known range.
+            if key < meta.smallest_key.as_str() || key > meta.largest_key.as_str() {
+                continue;
+            }
+            let path = sst_path(&self.data_dir, meta.file_id);
+            let Some(path_str) = path.to_str() else { continue };
+            let mut reader = match SsTableReader::open(path_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[db] failed to open L0 SSTable {:?}: {}", path, e);
                     continue;
                 }
-                let path = sst_path(&self.data_dir, meta.file_id);
-                let Some(path_str) = path.to_str() else { continue };
-                let mut reader = match SsTableReader::open(path_str) {
-                    Ok(r) => r,
-                    Err(ReaderError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                        continue 'retry;
-                    }
-                    Err(e) => {
-                        eprintln!("[db] failed to open L0 SSTable {:?}: {}", path, e);
-                        continue;
-                    }
-                };
-                match reader.search(key) {
-                    Ok(Some((_, Record::Put(v)))) => return Some(v),
-                    Ok(Some((_, Record::Delete))) => return None,
-                    Ok(None) => {}
-                    Err(e) => eprintln!("[db] error searching L0 SSTable {:?}: {}", path, e),
-                }
+            };
+            match reader.search(key) {
+                Ok(Some((_, Record::Put(v)))) => return Some(v),
+                Ok(Some((_, Record::Delete))) => return None,
+                Ok(None) => {}
+                Err(e) => eprintln!("[db] error searching L0 SSTable {:?}: {}", path, e),
             }
-
-            // L1+ files are non-overlapping and sorted by smallest_key within each
-            // level. Use partition_point to find the one candidate file per level.
-            for level in 1..7usize {
-                let files = version.files_at_level(level);
-                if files.is_empty() {
-                    continue;
-                }
-
-                // Find the last file whose smallest_key <= key.
-                let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
-                if pos == 0 {
-                    continue; // key precedes every file at this level
-                }
-                let meta = &files[pos - 1];
-                if meta.largest_key.as_str() < key {
-                    continue; // key falls in a gap between files
-                }
-
-                let path = sst_path(&self.data_dir, meta.file_id);
-                let Some(path_str) = path.to_str() else { continue };
-                let mut reader = match SsTableReader::open(path_str) {
-                    Ok(r) => r,
-                    Err(ReaderError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                        continue 'retry;
-                    }
-                    Err(e) => {
-                        eprintln!("[db] failed to open L{} SSTable {:?}: {}", level, path, e);
-                        continue;
-                    }
-                };
-                match reader.search(key) {
-                    Ok(Some((_, Record::Put(v)))) => return Some(v),
-                    Ok(Some((_, Record::Delete))) => return None,
-                    Ok(None) => {}
-                    Err(e) => eprintln!("[db] error searching L{} SSTable {:?}: {}", level, path, e),
-                }
-            }
-
-            return None;
         }
 
-        eprintln!(
-            "[db] exhausted {} read retries for key {:?}; \
-             version apply-before-unlink invariant may be broken",
-            MAX_READ_RETRIES, key,
-        );
+        // L1+ files are non-overlapping and sorted by smallest_key within each
+        // level. Use partition_point to find the one candidate file per level.
+        for level in 1..7usize {
+            let files = version.files_at_level(level);
+            if files.is_empty() {
+                continue;
+            }
+
+            // Find the last file whose smallest_key <= key.
+            let pos = files.partition_point(|m| m.smallest_key.as_str() <= key);
+            if pos == 0 {
+                continue; // key precedes every file at this level
+            }
+            let meta = &files[pos - 1];
+            if meta.largest_key.as_str() < key {
+                continue; // key falls in a gap between files
+            }
+
+            let path = sst_path(&self.data_dir, meta.file_id);
+            let Some(path_str) = path.to_str() else { continue };
+            let mut reader = match SsTableReader::open(path_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[db] failed to open L{} SSTable {:?}: {}", level, path, e);
+                    continue;
+                }
+            };
+            match reader.search(key) {
+                Ok(Some((_, Record::Put(v)))) => return Some(v),
+                Ok(Some((_, Record::Delete))) => return None,
+                Ok(None) => {}
+                Err(e) => eprintln!("[db] error searching L{} SSTable {:?}: {}", level, path, e),
+            }
+        }
+
         None
     }
 

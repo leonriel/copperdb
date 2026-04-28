@@ -1,8 +1,10 @@
-use std::fs::{File, OpenOptions};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::mem::size_of;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManifestError {
@@ -60,26 +62,64 @@ pub fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Refcounted handle to an on-disk SSTable file. Phase 1 of the read/compaction
-/// race fix: every `SstableMetadata` carries an `Arc<SstFileGuard>` so future
-/// work can hang an unlink-on-last-drop behaviour off this type without further
-/// plumbing changes.
+/// Refcounted handle to an on-disk SSTable file.
 ///
-/// Phase 1 keeps the existing system intact — `Drop` is a no-op, the compaction
-/// worker still calls `std::fs::remove_file` directly, and `engine::get` still
-/// retries on ENOENT. Phase 2 will give this type a `Drop` impl that unlinks
-/// the file, delete the explicit `remove_file` calls in the compactor, and
-/// remove the read-path retry loop in one go.
+/// Every `SstableMetadata` carries an `Arc<SstFileGuard>`. Cloning a
+/// `VersionState` (which `SharedVersion::apply` does on every CoW swap)
+/// clones the `Arc`, so a reader holding a `current_version()` snapshot pins
+/// every file it could read until the snapshot is dropped — even after
+/// compaction has swapped those files out of the live version.
+///
+/// ## Unlink semantics
+///
+/// `Drop` only unlinks when `should_unlink` is set. The flag is flipped by
+/// `VersionState::apply(RemoveFile)` immediately before the metadata is
+/// `retain`'d out of its level. Engine shutdown drops the live `VersionState`
+/// without ever flipping that flag, so files referenced by the live version at
+/// shutdown stay on disk and are recovered by the next session's manifest
+/// replay.
+///
+/// Note that compaction's old `RemoveFile` edits propagate the mark to *every*
+/// clone of the same `Arc<SstFileGuard>` — including clones held by old
+/// snapshots — but the actual `remove_file` syscall is deferred until the
+/// last `Arc` drops. So a long-running reader keeps the file alive through
+/// any number of compactions; the file goes away only when no one needs it.
 pub struct SstFileGuard {
     pub file_id: FileId,
-    /// Used by phase 2's `Drop` impl; allow dead_code in the meantime.
-    #[allow(dead_code)]
     pub path:    PathBuf,
+    should_unlink: AtomicBool,
 }
 
 impl SstFileGuard {
     pub(crate) fn new(file_id: FileId, dir: &Path) -> Self {
-        Self { file_id, path: sst_path(dir, file_id) }
+        Self {
+            file_id,
+            path: sst_path(dir, file_id),
+            should_unlink: AtomicBool::new(false),
+        }
+    }
+
+    /// Mark this file for unlink-on-last-drop. Called from
+    /// `VersionState::apply(RemoveFile)` so every clone of the guard observes
+    /// that the file is no longer part of any live version.
+    pub(crate) fn mark_for_deletion(&self) {
+        self.should_unlink.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SstFileGuard {
+    fn drop(&mut self) {
+        if !self.should_unlink.load(Ordering::SeqCst) {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            // The file may already be gone — e.g. a previous session's
+            // compactor unlinked it before crashing, and replay re-minted then
+            // dropped a marked guard for the same file_id. Treat as benign.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[sst] unlink {:?} failed: {}", self.path, e),
+        }
     }
 }
 
@@ -187,6 +227,15 @@ impl VersionState {
             VersionEdit::RemoveFile { level, file_id } => {
                 let level = *level as usize;
                 if level < self.levels.len() {
+                    // Mark the guard before retain. The mark propagates to all
+                    // clones of this `Arc<SstFileGuard>` (including the ones
+                    // held by older snapshots), so once the last reference
+                    // drops, `Drop` unlinks the file.
+                    if let Some(meta) =
+                        self.levels[level].iter().find(|m| m.file_id == *file_id)
+                    {
+                        meta.file.mark_for_deletion();
+                    }
                     self.levels[level].retain(|m| m.file_id != *file_id);
                 }
             }
@@ -280,6 +329,11 @@ impl Manifest {
     /// If the file already exists every intact record is replayed into a fresh
     /// `VersionState`. Replay stops at the first CRC mismatch — matching the
     /// WAL crash-recovery semantics in `wal.rs:replay`.
+    ///
+    /// After replay, any `.sst` file in `dir` not referenced by the final
+    /// version state is unlinked. These are orphans from a previous session
+    /// that wrote an SSTable to disk but crashed before committing the
+    /// `AddFile` edit to the manifest.
     pub fn open_or_create(dir: &Path) -> Result<(Self, VersionState), ManifestError> {
         let path = manifest_path(dir);
 
@@ -288,6 +342,8 @@ impl Manifest {
         } else {
             VersionState::new(dir.to_path_buf())
         };
+
+        sweep_orphans(dir, &version)?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -362,6 +418,50 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
 /// Returns `Err(ManifestError::UnknownEditType)` if a record passes its CRC
 /// check but carries an unrecognised edit type. This is distinct from a torn
 /// write and indicates genuine corruption or a version mismatch.
+/// Remove every `.sst` file in `dir` whose file id isn't tracked by `state`.
+///
+/// Targets crash-window orphans: the previous session wrote the SSTable to
+/// disk but died before the corresponding `AddFile` made it to the manifest,
+/// so neither the live `VersionState` nor any guard knows about the file.
+/// Without this sweep, those files would accumulate on disk forever.
+fn sweep_orphans(dir: &Path, state: &VersionState) -> io::Result<()> {
+    let live: HashSet<FileId> = state.all_file_ids().collect();
+
+    let entries = match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("sst") {
+            continue;
+        }
+        let Some(file_id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<FileId>().ok())
+        else {
+            continue;
+        };
+        if live.contains(&file_id) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                eprintln!("[sst] failed to sweep orphan {:?}: {}", path, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn replay(path: &Path, dir: &Path) -> Result<VersionState, ManifestError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
