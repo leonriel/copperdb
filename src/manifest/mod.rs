@@ -1,8 +1,10 @@
-use std::fs::{File, OpenOptions};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::mem::size_of;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ManifestError {
@@ -60,6 +62,84 @@ pub fn sst_path(dir: &Path, file_id: u64) -> PathBuf {
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Refcounted handle to an on-disk SSTable file.
+///
+/// Every `SstableMetadata` carries an `Arc<SstFileGuard>`. Cloning a
+/// `VersionState` (which `SharedVersion::apply` does on every CoW swap)
+/// clones the `Arc`, so a reader holding a `current_version()` snapshot pins
+/// every file it could read until the snapshot is dropped — even after
+/// compaction has swapped those files out of the live version.
+///
+/// ## Unlink semantics
+///
+/// `Drop` only unlinks when `should_unlink` is set. The flag is flipped by
+/// `VersionState::apply(RemoveFile)` immediately before the metadata is
+/// `retain`'d out of its level. Engine shutdown drops the live `VersionState`
+/// without ever flipping that flag, so files referenced by the live version at
+/// shutdown stay on disk and are recovered by the next session's manifest
+/// replay.
+///
+/// Note that compaction's old `RemoveFile` edits propagate the mark to *every*
+/// clone of the same `Arc<SstFileGuard>` — including clones held by old
+/// snapshots — but the actual `remove_file` syscall is deferred until the
+/// last `Arc` drops. So a long-running reader keeps the file alive through
+/// any number of compactions; the file goes away only when no one needs it.
+pub struct SstFileGuard {
+    pub file_id: FileId,
+    pub path:    PathBuf,
+    should_unlink: AtomicBool,
+}
+
+impl SstFileGuard {
+    pub(crate) fn new(file_id: FileId, dir: &Path) -> Self {
+        Self {
+            file_id,
+            path: sst_path(dir, file_id),
+            should_unlink: AtomicBool::new(false),
+        }
+    }
+
+    /// Mark this file for unlink-on-last-drop. Called from
+    /// `VersionState::apply(RemoveFile)` so every clone of the guard observes
+    /// that the file is no longer part of any live version.
+    pub(crate) fn mark_for_deletion(&self) {
+        self.should_unlink.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SstFileGuard {
+    fn drop(&mut self) {
+        if !self.should_unlink.load(Ordering::SeqCst) {
+            return;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            // The file may already be gone — e.g. a previous session's
+            // compactor unlinked it before crashing, and replay re-minted then
+            // dropped a marked guard for the same file_id. Treat as benign.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[sst] unlink {:?} failed: {}", self.path, e),
+        }
+    }
+}
+
+impl std::fmt::Debug for SstFileGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstFileGuard")
+            .field("file_id", &self.file_id)
+            .finish()
+    }
+}
+
+/// Two guards are equal iff they refer to the same file id. This lets
+/// `SstableMetadata` keep its derived `PartialEq` without comparing pointer
+/// identity of the `Arc`.
+impl PartialEq for SstFileGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_id == other.file_id
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SstableMetadata {
     pub file_id:      FileId,
@@ -72,6 +152,11 @@ pub struct SstableMetadata {
     /// highest-seq-wins compaction dedup would drop newer writes in favour of
     /// older SSTable records.
     pub max_seq:      u64,
+    /// Refcounted handle that keeps the on-disk file alive for as long as any
+    /// snapshot references this metadata. Cloning `SstableMetadata` clones the
+    /// `Arc`, so every snapshot returned by `SharedVersion::snapshot()`
+    /// automatically pins its files.
+    pub file:         Arc<SstFileGuard>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,12 +181,17 @@ pub enum VersionEdit {
 #[derive(Clone, Debug)]
 pub struct VersionState {
     levels: Vec<Vec<SstableMetadata>>,
+    /// Directory holding all SSTable files. Stored so `apply` can mint an
+    /// `SstFileGuard` for each new file without the caller having to thread
+    /// the path through every edit.
+    data_dir: PathBuf,
 }
 
 impl VersionState {
-    pub fn new() -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             levels: vec![Vec::new(); NUM_LEVELS],
+            data_dir,
         }
     }
 
@@ -118,6 +208,7 @@ impl VersionState {
                     smallest_key: smallest_key.clone(),
                     largest_key:  largest_key.clone(),
                     max_seq:      *max_seq,
+                    file:         Arc::new(SstFileGuard::new(*file_id, &self.data_dir)),
                 };
                 if level == 0 {
                     // L0 files may have overlapping key ranges; preserve flush
@@ -136,6 +227,15 @@ impl VersionState {
             VersionEdit::RemoveFile { level, file_id } => {
                 let level = *level as usize;
                 if level < self.levels.len() {
+                    // Mark the guard before retain. The mark propagates to all
+                    // clones of this `Arc<SstFileGuard>` (including the ones
+                    // held by older snapshots), so once the last reference
+                    // drops, `Drop` unlinks the file.
+                    if let Some(meta) =
+                        self.levels[level].iter().find(|m| m.file_id == *file_id)
+                    {
+                        meta.file.mark_for_deletion();
+                    }
                     self.levels[level].retain(|m| m.file_id != *file_id);
                 }
             }
@@ -192,10 +292,6 @@ impl VersionState {
 pub struct SharedVersion(RwLock<Arc<VersionState>>);
 
 impl SharedVersion {
-    pub fn new() -> Self {
-        Self(RwLock::new(Arc::new(VersionState::new())))
-    }
-
     /// Create a `SharedVersion` pre-loaded with a replayed `VersionState`.
     /// Used during engine recovery to restore the manifest state from disk.
     pub fn from_state(state: VersionState) -> Self {
@@ -233,14 +329,21 @@ impl Manifest {
     /// If the file already exists every intact record is replayed into a fresh
     /// `VersionState`. Replay stops at the first CRC mismatch — matching the
     /// WAL crash-recovery semantics in `wal.rs:replay`.
+    ///
+    /// After replay, any `.sst` file in `dir` not referenced by the final
+    /// version state is unlinked. These are orphans from a previous session
+    /// that wrote an SSTable to disk but crashed before committing the
+    /// `AddFile` edit to the manifest.
     pub fn open_or_create(dir: &Path) -> Result<(Self, VersionState), ManifestError> {
         let path = manifest_path(dir);
 
         let version = if path.exists() {
-            replay(&path)?
+            replay(&path, dir)?
         } else {
-            VersionState::new()
+            VersionState::new(dir.to_path_buf())
         };
+
+        sweep_orphans(dir, &version)?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -307,6 +410,50 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
     }
 }
 
+/// Remove every `.sst` file in `dir` whose file id isn't tracked by `state`.
+///
+/// Targets crash-window orphans: the previous session wrote the SSTable to
+/// disk but died before the corresponding `AddFile` made it to the manifest,
+/// so neither the live `VersionState` nor any guard knows about the file.
+/// Without this sweep, those files would accumulate on disk forever.
+fn sweep_orphans(dir: &Path, state: &VersionState) -> io::Result<()> {
+    let live: HashSet<FileId> = state.all_file_ids().collect();
+
+    let entries = match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("sst") {
+            continue;
+        }
+        let Some(file_id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<FileId>().ok())
+        else {
+            continue;
+        };
+        if live.contains(&file_id) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                eprintln!("[sst] failed to sweep orphan {:?}: {}", path, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Read all intact records from the MANIFEST file and build a `VersionState`.
 ///
 /// Stops at the first CRC mismatch without returning an error — that record
@@ -315,10 +462,10 @@ fn serialize_edit(edit: &VersionEdit) -> Vec<u8> {
 /// Returns `Err(ManifestError::UnknownEditType)` if a record passes its CRC
 /// check but carries an unrecognised edit type. This is distinct from a torn
 /// write and indicates genuine corruption or a version mismatch.
-fn replay(path: &Path) -> Result<VersionState, ManifestError> {
+fn replay(path: &Path, dir: &Path) -> Result<VersionState, ManifestError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut state = VersionState::new();
+    let mut state = VersionState::new(dir.to_path_buf());
     let mut byte_offset: u64 = 0;
 
     loop {
@@ -579,7 +726,7 @@ mod tests {
 
     #[test]
     fn overlapping_files_correct_range() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(1, 1, "apple",  "cherry"));  // [apple,  cherry]
         state.apply(&add(2, 1, "date",   "grape"));   // [date,   grape]
         state.apply(&add(3, 1, "mango",  "peach"));   // [mango,  peach]
@@ -604,7 +751,7 @@ mod tests {
     // Without the sorted-insert fix, files_at_level(1) would return [mango, date, apple].
     #[test]
     fn l1_files_sorted_after_out_of_order_apply() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(3, 1, "mango", "peach"));
         state.apply(&add(1, 1, "apple", "cherry"));
         state.apply(&add(2, 1, "date",  "grape"));
@@ -637,7 +784,7 @@ mod tests {
     // visits newest-first), not sort by key.
     #[test]
     fn l0_files_preserve_insertion_order() {
-        let mut state = VersionState::new();
+        let mut state = VersionState::new(tmp_dir());
         state.apply(&add(1, 0, "mango", "peach"));
         state.apply(&add(2, 0, "apple", "cherry"));
         state.apply(&add(3, 0, "date",  "grape"));
@@ -665,7 +812,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         const N_THREADS: usize = 8;
         const FILES_PER_THREAD: usize = 10;
@@ -708,7 +855,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Seed one file before taking the snapshot.
         {
@@ -763,7 +910,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Each tuple is (file_id, key). Deliberately not in key order.
         let files: &[(u64, &str)] = &[
@@ -819,7 +966,7 @@ mod tests {
         use std::thread;
 
         let version: Arc<RwLock<Arc<VersionState>>> =
-            Arc::new(RwLock::new(Arc::new(VersionState::new())));
+            Arc::new(RwLock::new(Arc::new(VersionState::new(tmp_dir()))));
 
         // Seed two L1 files that compaction will replace.
         {
@@ -890,6 +1037,91 @@ mod tests {
         assert!(
             !any_partial.load(std::sync::atomic::Ordering::Relaxed),
             "A reader observed a partial compaction state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SstFileGuard unlink behaviour
+    // -----------------------------------------------------------------------
+
+    /// An unmarked guard must leave its file on disk when dropped. This is
+    /// what protects files referenced by the live `VersionState` from being
+    /// destroyed at engine shutdown.
+    #[test]
+    fn unmarked_guard_does_not_unlink_on_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 1;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+        assert!(path.exists(), "test setup: file should exist before drop");
+
+        {
+            let _guard = SstFileGuard::new(file_id, &dir);
+            // Default `should_unlink` is false; no `mark_for_deletion`.
+        }
+
+        assert!(
+            path.exists(),
+            "an unmarked guard must not unlink its underlying file on drop",
+        );
+    }
+
+    /// A guard whose `should_unlink` flag has been set must unlink its file
+    /// when the last `Arc` to it drops.
+    #[test]
+    fn marked_guard_unlinks_on_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 2;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+        assert!(path.exists(), "test setup: file should exist before drop");
+
+        {
+            let guard = SstFileGuard::new(file_id, &dir);
+            guard.mark_for_deletion();
+        }
+
+        assert!(
+            !path.exists(),
+            "a marked guard must unlink its underlying file on drop",
+        );
+    }
+
+    /// `mark_for_deletion` is called on an `&SstFileGuard` reached via one
+    /// Arc clone; the inner `AtomicBool` is shared, so any other Arc clone
+    /// observes the mark when its turn to drop comes. This is the contract
+    /// that lets `apply(RemoveFile)` mark a guard while older snapshots are
+    /// still pinning the file: the unlink is deferred until the last
+    /// snapshot releases its clone, at which point Drop sees the mark and
+    /// unlinks.
+    #[test]
+    fn mark_propagates_across_arc_clones_and_unlinks_on_last_drop() {
+        let dir = tmp_dir();
+        let file_id: FileId = 3;
+        let path = sst_path(&dir, file_id);
+
+        std::fs::write(&path, b"sstable bytes").unwrap();
+
+        let g1 = Arc::new(SstFileGuard::new(file_id, &dir));
+        let g2 = Arc::clone(&g1);
+
+        // Mark via g1; g2 must observe the same mark.
+        g1.mark_for_deletion();
+
+        // Dropping g1 must NOT unlink — g2 still pins the guard.
+        drop(g1);
+        assert!(
+            path.exists(),
+            "file should still exist while another Arc clone is alive",
+        );
+
+        // Dropping the last reference fires Drop, which sees the mark and unlinks.
+        drop(g2);
+        assert!(
+            !path.exists(),
+            "file should be unlinked once the last marked Arc clone drops",
         );
     }
 }

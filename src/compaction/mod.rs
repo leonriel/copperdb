@@ -436,13 +436,10 @@ fn compact_level(
 
     engine.record_compaction(&removed, &output_files)?;
 
-    // Delete the now-superseded SSTable files from disk.
-    for meta in inputs_from_level.iter().chain(inputs_from_output_level.iter()) {
-        let path = sst_path(&engine.data_dir, meta.file_id);
-        if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("[compaction] could not delete {:?}: {}", path, e);
-        }
-    }
+    // Files are unlinked via `Arc<SstFileGuard>` refcounts: `apply(RemoveFile)`
+    // marks the guard, and the actual `remove_file` syscall fires when the
+    // last clone drops (typically when the old `Arc<VersionState>` snapshot
+    // is released by readers). No manual cleanup needed here.
 
     Ok(())
 }
