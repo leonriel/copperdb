@@ -1,8 +1,9 @@
 use std::ops::Bound;
-use std::sync::Weak;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 
-use crate::engine::{LsmEngine};
+use crate::engine::EngineCore;
 use crate::manifest::{sst_path};
 use crate::memtable::MemTable;
 use crate::sstable::writer::SsTableBuilder;
@@ -10,24 +11,22 @@ use crate::wal::wal_path;
 
 /// Entry point for the background flush thread.
 ///
-/// Holds a `Weak<LsmEngine>` to avoid a reference cycle: if the engine is
-/// dropped, the weak upgrade fails and the flusher exits cleanly. The channel
-/// closing (when `flush_tx` inside LsmEngine is dropped) is the primary exit
-/// signal; the Weak check is a safety net.
-pub fn run(engine: Weak<LsmEngine>, rx: Receiver<()>) {
+/// Holds a strong `Arc<EngineCore>` so the shared state stays alive for the
+/// duration of any in-flight flush. Exits when `LsmEngine::drop` sets
+/// `core.shutdown` and wakes the channel — at which point this thread's Arc
+/// is the last outstanding reference to `EngineCore` and it's dropped on
+/// return.
+pub fn run(core: Arc<EngineCore>, rx: Receiver<()>) {
     for () in &rx {
-        let Some(engine) = engine.upgrade() else { break; };
-        flush_pending(&engine);
-    }
-    // Channel closed — do one final drain in case a freeze happened just
-    // before shutdown.
-    if let Some(engine) = engine.upgrade() {
-        flush_pending(&engine);
+        if core.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        flush_pending(&core);
     }
 }
 
 /// Flush all immutable MemTables that are currently waiting, in FIFO order.
-fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
+fn flush_pending(engine: &EngineCore) {
     while let Some(table) = engine.state.get_oldest_immutable() {
         // Spin-wait for any in-flight writers on this now-frozen table.
         // The table is immutable so no new writers will increment the counter;
@@ -99,6 +98,7 @@ fn flush_pending(engine: &std::sync::Arc<LsmEngine>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::LsmEngine;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 

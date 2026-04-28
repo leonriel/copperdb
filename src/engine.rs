@@ -1,8 +1,10 @@
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::thread::JoinHandle;
 
 use async_trait::async_trait;
 
@@ -21,12 +23,10 @@ const MAX_IMMUTABLE_TABLES: usize = 4;
 /// queue before giving up and returning an error.
 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Core engine: coordinates WAL writes and MemTable inserts.
-///
-/// Write path: WAL append → MemTable insert → rotate if frozen → signal flusher.
-/// Read path:  MemTableState (active first, then immutables in reverse order).
-/// Recovery:   replay all unflushed WAL files on `open`.
-pub struct LsmEngine {
+/// Shared engine state. Threads hold `Arc<EngineCore>` directly so they keep
+/// the core alive for the duration of their work; the user-facing `LsmEngine`
+/// wrapper owns the thread `JoinHandle`s and joins them on drop.
+pub struct EngineCore {
     pub(crate) state:    MemTableState,
     active_wal:          Mutex<Wal<Crc32Checksum>>,
     next_seq:            AtomicU64,
@@ -37,6 +37,58 @@ pub struct LsmEngine {
     compact_tx:          Sender<()>,
     manifest:            Mutex<Manifest>,
     flush_tx:            Sender<()>,
+    /// Signals background workers to exit on their next loop iteration.
+    /// Set by `LsmEngine::drop` together with a wake-up on each channel.
+    pub(crate) shutdown: AtomicBool,
+}
+
+/// Core engine: coordinates WAL writes and MemTable inserts.
+///
+/// Write path: WAL append → MemTable insert → rotate if frozen → signal flusher.
+/// Read path:  MemTableState (active first, then immutables in reverse order).
+/// Recovery:   replay all unflushed WAL files on `open`.
+///
+/// ## Shutdown safety
+///
+/// `LsmEngine` owns the `JoinHandle`s for the background flusher and compactor
+/// threads. Its `Drop` impl sets `core.shutdown`, wakes each worker, and joins
+/// them before returning. This guarantees that no worker is still touching the
+/// data directory (deleting WAL files, writing SSTables, updating the manifest)
+/// after the user's drop returns — which matters because the very next moment
+/// the user can reopen the same directory, and a session-1 worker racing with
+/// session-2 recovery would corrupt state.
+///
+/// The worker threads hold `Arc<EngineCore>` (strong), not `Arc<LsmEngine>`, so
+/// they keep the shared state alive for the duration of their work but never
+/// prevent the user's last `Arc<LsmEngine>` from reaching refcount zero (which
+/// is what fires this `Drop`).
+pub struct LsmEngine {
+    inner:             Arc<EngineCore>,
+    flusher_handle:    Option<JoinHandle<()>>,
+    compactor_handle:  Option<JoinHandle<()>>,
+}
+
+impl Deref for LsmEngine {
+    type Target = EngineCore;
+    fn deref(&self) -> &EngineCore { &self.inner }
+}
+
+impl Drop for LsmEngine {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        // Wake each worker so it can observe the shutdown flag. The sends may
+        // fail if a worker has already exited and dropped its receiver — we
+        // don't care, we just need to unblock any thread sitting in recv().
+        let _ = self.inner.flush_tx.send(());
+        let _ = self.inner.compact_tx.send(());
+
+        if let Some(h) = self.flusher_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.compactor_handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl LsmEngine {
@@ -84,7 +136,7 @@ impl LsmEngine {
 
         let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
 
-        let engine = Arc::new(Self {
+        let core = Arc::new(EngineCore {
             state,
             active_wal:   Mutex::new(active_wal),
             next_seq:     AtomicU64::new(max_seq + 1),
@@ -95,20 +147,32 @@ impl LsmEngine {
             manifest:     Mutex::new(manifest),
             next_sst_id:  AtomicU64::new(next_sst_id),
             flush_tx,
+            shutdown:     AtomicBool::new(false),
         });
 
-        let compaction_weak = Arc::downgrade(&engine);
-        std::thread::spawn(move || crate::compaction::run(compaction_weak, compact_rx));
-            
+        // Workers hold a strong Arc<EngineCore> so the shared state stays alive
+        // for the duration of any in-flight flush or compaction. They do NOT
+        // hold an Arc<LsmEngine>, so the user dropping their last handle fires
+        // `LsmEngine::drop`, which then joins these threads.
+        let compaction_core = Arc::clone(&core);
+        let compactor_handle = std::thread::spawn(move || {
+            crate::compaction::run(compaction_core, compact_rx)
+        });
 
-        // The flusher holds a Weak reference to avoid a cycle: if the engine Arc
-        // is dropped, the Weak upgrade fails and the flusher exits cleanly.
-        let flusher_weak = Arc::downgrade(&engine);
-        std::thread::spawn(move || crate::flusher::run(flusher_weak, flush_rx));
+        let flusher_core = Arc::clone(&core);
+        let flusher_handle = std::thread::spawn(move || {
+            crate::flusher::run(flusher_core, flush_rx)
+        });
 
-        Ok(engine)
+        Ok(Arc::new(Self {
+            inner: core,
+            flusher_handle:   Some(flusher_handle),
+            compactor_handle: Some(compactor_handle),
+        }))
     }
+}
 
+impl EngineCore {
     /// Durably write a key-value pair.
     ///
     /// Blocks if the immutable memtable queue is full (backpressure). Returns
@@ -695,6 +759,82 @@ mod tests {
             Some(b"session_2".as_slice()),
             "after final restart, session-2 value must still be readable",
         );
+    }
+
+    /// Regression for bug #3: dropping `LsmEngine` returns before the
+    /// background flusher and compactor have finished. A user that immediately
+    /// reopens the same directory can race with session N's workers still
+    /// writing SSTables, deleting WALs, and appending to the manifest — the
+    /// new session sees torn files, missing WALs, or duplicate file IDs.
+    ///
+    /// Post-fix: `Drop` signals shutdown, wakes both workers, and joins their
+    /// handles before returning. Back-to-back sessions with no sleeps between
+    /// them must all read every prior session's writes.
+    #[test]
+    fn drop_joins_workers_so_back_to_back_sessions_dont_race() {
+        const TINY_MEMTABLE: usize = 4 * 1024;
+        const SESSIONS: u32 = 12;
+        let dir = tmp_dir();
+
+        for session in 0..SESSIONS {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+
+            // Every key written by a prior session must still be readable.
+            for prior in 0..session {
+                let k = format!("sess_{:02}", prior);
+                assert_eq!(
+                    engine.get(&k).as_deref(),
+                    Some(format!("v_{}", prior).as_bytes()),
+                    "session {}: key from session {} lost across restarts \
+                     (likely drop-vs-recovery race with background workers)",
+                    session, prior,
+                );
+            }
+
+            engine
+                .put(format!("sess_{:02}", session), format!("v_{}", session).into_bytes())
+                .unwrap();
+
+            // Force several freezes so the flusher is actively working right
+            // up to the `drop` boundary.
+            for i in 0u32..12 {
+                engine
+                    .put(format!("filler_{:02}_{:04}", session, i), vec![i as u8; 2048])
+                    .unwrap();
+            }
+
+            // Drop immediately — no sleep. The fix requires `Drop` to join
+            // the flusher/compactor before returning.
+        }
+    }
+
+    /// A narrower version of the same contract: after a single session that
+    /// forced flushes, reopening without any delay must see every written key.
+    #[test]
+    fn reopen_right_after_drop_sees_all_writes() {
+        const TINY_MEMTABLE: usize = 4 * 1024;
+        let dir = tmp_dir();
+
+        let keys: Vec<(String, Vec<u8>)> = (0u32..200)
+            .map(|i| (format!("k_{:04}", i), vec![i as u8; 200]))
+            .collect();
+
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+            for (k, v) in &keys {
+                engine.put(k.clone(), v.clone()).unwrap();
+            }
+            // No sleep — drop must wait for workers to settle.
+        }
+
+        let engine = LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+        for (k, v) in &keys {
+            assert_eq!(
+                engine.get(k).as_deref(),
+                Some(v.as_slice()),
+                "{k} missing after drop+reopen with no pause",
+            );
+        }
     }
 
     #[test]

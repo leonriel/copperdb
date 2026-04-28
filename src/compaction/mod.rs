@@ -3,11 +3,12 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::mpsc::Receiver;
 
 use crate::core::{InternalKey, KvIterator, Record};
-use crate::engine::LsmEngine;
+use crate::engine::EngineCore;
 use crate::manifest::{SstableMetadata, VersionState, sst_path};
 use crate::sstable::block::Block;
 use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER, META_OFFSET_SIZE};
@@ -308,18 +309,16 @@ impl KvIterator for MergingIterator {
 /// Entry point for the background compaction thread.
 ///
 /// Woken up by a signal on `rx` (sent by the engine after each compaction
-/// round or after registering a new SSTable). Holds a `Weak<LsmEngine>` so
-/// the engine can be cleanly dropped.
-pub fn run(engine: Weak<LsmEngine>, rx: Receiver<()>) {
+/// round or after registering a new SSTable). Holds a strong `Arc<EngineCore>`
+/// so the shared state stays alive for the duration of any in-flight
+/// compaction; `LsmEngine::drop` sets `core.shutdown` and wakes the channel
+/// to cleanly tear this thread down.
+pub fn run(core: Arc<EngineCore>, rx: Receiver<()>) {
     for () in &rx {
-        let Some(engine) = engine.upgrade() else { break };
-        compact_if_needed(&engine);
-    }
-
-    // Channel closed. Do a final pass in case a signal arrived just before
-    // shutdown.
-    if let Some(engine) = engine.upgrade() {
-        compact_if_needed(&engine);
+        if core.shutdown.load(AtomicOrdering::SeqCst) {
+            break;
+        }
+        compact_if_needed(&core);
     }
 }
 
@@ -329,7 +328,7 @@ pub fn run(engine: Weak<LsmEngine>, rx: Receiver<()>) {
 
 /// Check every level (lowest first) and compact the first one that exceeds
 /// its size/file-count threshold.
-fn compact_if_needed(engine: &Arc<LsmEngine>) {
+fn compact_if_needed(engine: &EngineCore) {
     let version = engine.current_version();
 
     for level in 0..NUM_LEVELS - 1 {
@@ -372,7 +371,7 @@ fn level_max_bytes(level: usize) -> u64 {
 /// overlapping files from `level + 1`, write the results, and update the
 /// version state.
 fn compact_level(
-    engine: &Arc<LsmEngine>,
+    engine: &EngineCore,
     version: &VersionState,
     level: usize,
 ) -> Result<(), CompactionError> {
@@ -457,7 +456,7 @@ fn is_bottommost_level(version: &VersionState, level: usize) -> bool {
 /// SSTable files at `output_level`. Returns
 /// `(level, file_id, smallest_key, largest_key, max_seq)` for every new file.
 fn merge_and_write(
-    engine: &Arc<LsmEngine>,
+    engine: &EngineCore,
     mut iter: MergingIterator,
     output_level: u8,
     drop_tombstones: bool,
@@ -539,6 +538,7 @@ fn merge_and_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::LsmEngine;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 

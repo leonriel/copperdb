@@ -147,6 +147,47 @@ proptest! {
         }
     }
 
+    /// The combined case: tiny memtable (many flushes in-flight) AND a
+    /// drop-then-reopen boundary. Before bug #3 was fixed, `LsmEngine::drop`
+    /// returned while the flusher/compactor were still touching the data
+    /// directory, so the second session's `open` raced against the first
+    /// session's workers — producing sporadic corruption (partial SSTables,
+    /// missing WALs, torn manifest entries). With `Drop` joining the workers,
+    /// every session-1 write must be readable in session 2.
+    #[test]
+    fn restart_with_flushes_preserves_state(ops in ops_strategy(300)) {
+        let dir = tmp_dir();
+        let mut oracle: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+        {
+            let engine = LsmEngine::open_with_memtable_size(&dir, 4 * 1024).unwrap();
+            for op in &ops {
+                match op {
+                    Op::Put(k, v) => {
+                        engine.put(k.clone(), v.clone()).unwrap();
+                        oracle.insert(k.clone(), v.clone());
+                    }
+                    Op::Delete(k) => {
+                        engine.delete(k.clone()).unwrap();
+                        oracle.remove(k);
+                    }
+                    Op::Get(_) => {}
+                }
+            }
+            // Intentionally no sleep — exercise the drop-joins-workers
+            // contract.
+        }
+
+        let engine = LsmEngine::open(&dir).unwrap();
+        for i in 0..KEY_SPACE {
+            let k = format!("key_{:03}", i);
+            let actual = engine.get(&k);
+            let expected = oracle.get(&k).cloned();
+            prop_assert_eq!(&actual, &expected,
+                "after drop+reopen with flushes mid-flight, get({}) mismatch", k);
+        }
+    }
+
     #[test]
     fn flushes_and_compactions_preserve_state(ops in ops_strategy(500)) {
         let dir = tmp_dir();
