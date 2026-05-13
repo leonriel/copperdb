@@ -87,15 +87,43 @@ impl Manifest {
         Ok((Manifest { writer: BufWriter::new(file) }, version))
     }
 
-    /// Append one version edit. The CRC32 is computed over the payload bytes
-    /// that follow the checksum field, identical to the WAL record format.
-    pub fn append(&mut self, edit: &VersionEdit) -> io::Result<()> {
-        let payload = serialize_edit(edit);
-        let checksum = Crc32Checksum::compute(&payload);
+    /// Append one or more version edits as a single durable batch.
+    ///
+    /// Each edit is serialised as an independent CRC-framed record (same
+    /// on-disk format as a sequence of single-edit appends). The whole batch
+    /// is written to the kernel in one `write_all`, the `BufWriter` is
+    /// flushed, and `fsync` is called on the underlying file — so when this
+    /// returns, every record is durable on disk.
+    ///
+    /// For copperdb's compaction batch sizes (a few removes + a few adds,
+    /// well under a 4 KB page), the kernel commits the dirty page either
+    /// entirely or not at all, so this is effectively atomic on disk. A
+    /// cross-page partial commit is still possible for very large batches;
+    /// in that case, replay stops at the first torn record exactly as for a
+    /// single-record torn-write today.
+    pub fn append_batch(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
 
-        self.writer.write_all(&checksum.to_be_bytes())?;
-        self.writer.write_all(&payload)?;
-        self.writer.flush()
+        let mut buf = Vec::new();
+        for edit in edits {
+            let payload = serialize_edit(edit);
+            let checksum = Crc32Checksum::compute(&payload);
+            buf.extend_from_slice(&checksum.to_be_bytes());
+            buf.extend_from_slice(&payload);
+        }
+
+        self.writer.write_all(&buf)?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()
+    }
+
+    /// Append a single version edit. Thin wrapper over `append_batch` so
+    /// single-edit callers (e.g. `record_flush`) inherit the same durability
+    /// guarantee.
+    pub fn append(&mut self, edit: &VersionEdit) -> io::Result<()> {
+        self.append_batch(std::slice::from_ref(edit))
     }
 }
 
@@ -473,5 +501,40 @@ mod tests {
         let files = state.files_at_level(1);
         let keys: Vec<&str> = files.iter().map(|m| m.smallest_key.as_str()).collect();
         assert_eq!(keys, vec!["apple", "date", "mango"]);
+    }
+
+    // A mixed batch of removes and adds written through `append_batch` must
+    // survive a clean reopen with the final version state matching what
+    // sequential applies would have produced. This pins the contract that
+    // record_compaction relies on: the manifest persists every edit in the
+    // batch as one durable unit.
+    #[test]
+    fn append_batch_round_trip_replays_all_records() {
+        let dir = tmp_dir();
+
+        // Seed two L1 files so the batch's removes have something to drop.
+        {
+            let (mut m, _) = Manifest::open_or_create(&dir).unwrap();
+            m.append(&add(1, 1, "apple", "fig")).unwrap();
+            m.append(&add(2, 1, "grape", "mango")).unwrap();
+        }
+
+        // Now write a compaction-shaped batch: remove both L1 inputs, add two
+        // L2 outputs.
+        {
+            let (mut m, _) = Manifest::open_or_create(&dir).unwrap();
+            let batch = [
+                remove(1, 1),
+                remove(2, 1),
+                add(3, 2, "apple", "fig"),
+                add(4, 2, "grape", "mango"),
+            ];
+            m.append_batch(&batch).unwrap();
+        }
+
+        let (_, state) = Manifest::open_or_create(&dir).unwrap();
+        assert!(state.files_at_level(1).is_empty(), "L1 should be empty after batch removes");
+        let l2: Vec<u64> = state.files_at_level(2).iter().map(|m| m.file_id).collect();
+        assert_eq!(l2, vec![3, 4], "L2 should contain both batch adds, in sorted order");
     }
 }
