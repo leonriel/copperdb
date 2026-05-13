@@ -381,9 +381,7 @@ impl EngineCore {
 
         {
             let mut manifest = self.manifest.lock().unwrap();
-            for edit in &edits {
-                manifest.append(edit)?;
-            }
+            manifest.append_batch(&edits)?;
         }
 
         self.version.apply(&edits);
