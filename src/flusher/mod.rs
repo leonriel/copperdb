@@ -4,10 +4,9 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 
 use crate::engine::EngineCore;
-use crate::manifest::{sst_path};
+use crate::versioning::sst_path;
 use crate::memtable::MemTable;
 use crate::sstable::writer::SsTableBuilder;
-use crate::wal::wal_path;
 
 /// Entry point for the background flush thread.
 ///

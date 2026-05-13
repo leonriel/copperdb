@@ -4,7 +4,7 @@ mod memtable;
 mod sstable;
 mod wal;
 mod compaction;
-mod manifest;
+mod versioning;
 mod flusher;
 mod server;
 
