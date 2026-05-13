@@ -16,6 +16,11 @@ use crate::sstable::reader::SsTableReader;
 
 use std::time::Duration;
 
+#[cfg(test)]
+mod property_tests;
+#[cfg(test)]
+mod stress_tests;
+
 const MAX_MEMTABLE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_IMMUTABLE_TABLES: usize = 4;
 
