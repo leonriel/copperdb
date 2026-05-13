@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use crate::core::{EngineError, Record, StorageEngine};
 use crate::memtable::state::MemTableState;
 use crate::wal::{Crc32Checksum, Wal, WalOpType, recover_all};
-use crate::manifest::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
+use crate::versioning::{Manifest, VersionEdit, VersionState, SharedVersion, sst_path};
 use crate::sstable::reader::SsTableReader;
 
 use std::time::Duration;
