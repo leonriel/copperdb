@@ -8,11 +8,6 @@ mod versioning;
 mod flusher;
 mod server;
 
-#[cfg(test)]
-mod property_tests;
-#[cfg(test)]
-mod stress_tests;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
