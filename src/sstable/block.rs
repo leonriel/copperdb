@@ -2,12 +2,19 @@ use std::mem::size_of;
 
 use crate::core::{CoreError, InternalKey, Record, RecordTag};
 
+/// Default target size for data blocks (4 KB). The index block uses a much
+/// larger target (see `INDEX_TARGET_BLOCK_SIZE` in `writer.rs`) because it
+/// must hold one entry per data block in the whole SSTable.
 const TARGET_BLOCK_SIZE: usize = 4096;
 
 // --- Binary Layout Types ---
 pub type KeyLen = u16;
 pub type ValueLen = u32;
-pub type Offset = u16;
+/// In-block byte offset and entry count. `u32` so a single block can be up to
+/// 4 GB — large enough for an index block that maps every data block in a
+/// multi-MB SSTable. Data blocks themselves stay small (`TARGET_BLOCK_SIZE`);
+/// only the index block actually exercises the larger range.
+pub type Offset = u32;
 
 // --- Compile-Time Size Constants ---
 const KEY_LEN_SIZE: usize = size_of::<KeyLen>();
@@ -45,27 +52,40 @@ impl From<CoreError> for BlockError {
 ///
 /// Entries are appended in sorted order. The builder tracks the estimated
 /// size and rejects new entries (returning `false` from `add`) once the
-/// block would exceed `TARGET_BLOCK_SIZE` (4 KB). Calling `build` finalizes
-/// the block by appending the offset array and entry count footer.
+/// block would exceed `target_size`. Data blocks use the default
+/// `TARGET_BLOCK_SIZE` (4 KB); the index block uses a much larger budget
+/// via `with_target_size`. Calling `build` finalizes the block by appending
+/// the offset array and entry count footer.
 pub struct BlockBuilder {
     data: Vec<u8>,
     offsets: Vec<Offset>,
+    target_size: usize,
 }
 
 impl BlockBuilder {
-    /// Creates a new, empty `BlockBuilder` ready to accept entries.
+    /// Creates a new, empty `BlockBuilder` ready to accept entries. Uses the
+    /// default 4 KB data-block target.
     pub fn new() -> Self {
+        Self::with_target_size(TARGET_BLOCK_SIZE)
+    }
+
+    /// Creates a `BlockBuilder` with a non-default target byte budget. Used
+    /// by the SSTable writer to build an index block that's larger than a
+    /// data block, since one index entry is needed per data block in the
+    /// whole file.
+    pub fn with_target_size(target_size: usize) -> Self {
         Self {
             data: Vec::new(),
             offsets: Vec::new(),
+            target_size,
         }
     }
 
     /// Serializes and appends a key-record pair to the block.
     ///
     /// Returns `true` if the entry was added, or `false` if adding it would
-    /// exceed `TARGET_BLOCK_SIZE`. The first entry is always accepted
-    /// regardless of size.
+    /// exceed the builder's `target_size`. The first entry is always
+    /// accepted regardless of size.
     pub fn add(&mut self, key: &InternalKey, record: &Record) -> bool {
         let key_bytes = key.user_key.as_bytes();
         let key_len = key_bytes.len() as KeyLen;
@@ -79,7 +99,7 @@ impl BlockBuilder {
         let estimated_size =
             self.data.len() + entry_size + (self.offsets.len() + 1) * OFFSET_SIZE + OFFSET_SIZE;
 
-        if !self.is_empty() && estimated_size > TARGET_BLOCK_SIZE {
+        if !self.is_empty() && estimated_size > self.target_size {
             return false;
         }
 
@@ -127,8 +147,9 @@ impl BlockBuilder {
 /// A read-only view over a serialized block of key-record entries.
 ///
 /// The binary layout is: serialized entries, followed by an array of `Offset`
-/// values pointing to each entry, followed by a `u16` entry count footer.
-/// Supports random access via `decode_entry` and binary search via `search`.
+/// values pointing to each entry, followed by an `Offset`-sized entry count
+/// footer. Supports random access via `decode_entry` and binary search via
+/// `search`.
 pub struct Block {
     data: Vec<u8>,
 }

@@ -56,8 +56,13 @@ file. Each index entry is:
 - **Value**: the data block's starting byte offset as a big-endian `u64` (8 bytes),
   stored as a `Record::Put`.
 
-The index block is currently limited to a single block. If the index exceeds
-`TARGET_BLOCK_SIZE`, the writer returns an error.
+The index block uses a larger byte budget than data blocks
+(`INDEX_TARGET_BLOCK_SIZE = 1 MB` vs `TARGET_BLOCK_SIZE = 4 KB`) because it
+must hold one entry per data block in the entire SSTable. At ~50 bytes per
+index entry, 1 MB holds ~20,000 entries — addressing roughly 80 MB of data,
+which covers the compaction-output cap with headroom. The block format itself
+is unchanged; only the target size differs. If the index ever exceeds 1 MB,
+the writer returns an error and multi-level indexing becomes necessary.
 
 ### Footer (24 bytes)
 
@@ -94,10 +99,13 @@ All blocks (data and index) share the same binary format:
 
 ### Block Footer
 
-The last 2 bytes of a block store the number of entries (`num_offsets`) as a
-big-endian `u16`. Immediately before that is an array of `num_offsets`
-big-endian `u16` values, each pointing to the byte offset of the corresponding
-entry within the block's data section.
+The last 4 bytes of a block store the number of entries (`num_offsets`) as a
+big-endian `u32`. Immediately before that is an array of `num_offsets`
+big-endian `u32` values, each pointing to the byte offset of the corresponding
+entry within the block's data section. The `u32` width lets a single block
+address up to 4 GB — only relevant for the index block (data blocks stay
+small), but keeping one offset format across both block types simplifies the
+reader.
 
 ### Entry Layout
 

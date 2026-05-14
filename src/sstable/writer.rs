@@ -28,6 +28,14 @@ const BLOOM_FP_RATE: f64 = 0.01;
 /// raises the false-positive rate.
 const BLOOM_ESTIMATED_ITEMS: u32 = 10_000;
 
+/// Target byte budget for the index block. The index needs one entry per
+/// data block in the whole SSTable; at 4 KB data blocks and ~50-byte index
+/// entries, 1 MB holds ~20k entries → addresses ~80 MB of data, which
+/// comfortably covers the compaction-output cap. Pay the resident-memory
+/// cost (one of these per open SSTable) in exchange for keeping a
+/// single-level index.
+const INDEX_TARGET_BLOCK_SIZE: usize = 1024 * 1024;
+
 /// Writes a sorted stream of key-record pairs to an on-disk SSTable file.
 ///
 /// `build_from_iterator` consumes a `KvIterator` (typically from a frozen
@@ -138,8 +146,9 @@ impl SsTableBuilder {
         self.file.write_all(&meta_data)?;
         self.current_offset += meta_data.len() as u64;
 
-        // Build the Index Block
-        let mut index_block = BlockBuilder::new();
+        // Build the Index Block — uses a larger target than data blocks
+        // since one index entry is required per data block in the whole file.
+        let mut index_block = BlockBuilder::with_target_size(INDEX_TARGET_BLOCK_SIZE);
         for (first_key, offset) in &self.block_index {
             let index_key = InternalKey {
                 user_key: first_key.clone(),
@@ -150,7 +159,7 @@ impl SsTableBuilder {
             let added = index_block.add(&index_key, &index_record);
             if !added {
                 return Err(WriterError::InvalidData(
-                    "Index block exceeded TARGET_BLOCK_SIZE. Multi-level index implementation required.".to_string()
+                    "Index block exceeded INDEX_TARGET_BLOCK_SIZE. Multi-level index implementation required.".to_string()
                 ));
             }
         }
@@ -239,8 +248,9 @@ impl SsTableBuilder {
         self.file.write_all(&meta_data)?;
         self.current_offset += meta_data.len() as u64;
 
-        // Build and write the Index Block
-        let mut index_block = BlockBuilder::new();
+        // Build and write the Index Block (see build_from_iterator for the
+        // size rationale).
+        let mut index_block = BlockBuilder::with_target_size(INDEX_TARGET_BLOCK_SIZE);
         for (first_key, offset) in &self.block_index {
             let index_key = InternalKey {
                 user_key: first_key.clone(),
@@ -249,7 +259,7 @@ impl SsTableBuilder {
             let index_record = Record::Put(offset.to_be_bytes().to_vec());
             if !index_block.add(&index_key, &index_record) {
                 return Err(WriterError::InvalidData(
-                    "Index block exceeded TARGET_BLOCK_SIZE; multi-level index required"
+                    "Index block exceeded INDEX_TARGET_BLOCK_SIZE; multi-level index required"
                         .to_string(),
                 ));
             }
