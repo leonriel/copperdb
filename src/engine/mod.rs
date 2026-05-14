@@ -105,7 +105,11 @@ impl LsmEngine {
         Self::open_with_memtable_size(dir, MAX_MEMTABLE_SIZE)
     }
 
-    pub(crate) fn open_with_memtable_size(
+    /// Open with a non-default memtable byte budget. The default
+    /// `MAX_MEMTABLE_SIZE` is 64 MB; tests and the benchmark harness use
+    /// smaller values to drive flushes/compactions with workloads that fit
+    /// in a reasonable wall-clock time.
+    pub fn open_with_memtable_size(
         dir: &Path,
         memtable_size: usize,
     ) -> io::Result<Arc<Self>> {
