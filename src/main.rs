@@ -1,18 +1,9 @@
-mod core;
-mod engine;
-mod memtable;
-mod sstable;
-mod wal;
-mod compaction;
-mod versioning;
-mod flusher;
-mod server;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::core::StorageEngine;
-use crate::engine::{LsmEngine, LsmHandle};
+use copperdb::core::StorageEngine;
+use copperdb::engine::{LsmEngine, LsmHandle};
+use copperdb::server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
