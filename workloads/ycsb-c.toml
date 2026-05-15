@@ -1,0 +1,12 @@
+# YCSB-C — 100% read, Zipfian.
+#
+# Pure read workload. Useful as a baseline for the read path with no
+# write-side interference (no flushes, no compactions triggered by the bench).
+
+name = "YCSB-C"
+description = "Read-only; Zipfian-skewed access"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "zipfian"
+zipfian_theta = 0.99
+op_mix = { read = 1.0, update = 0.0, insert = 0.0, rmw = 0.0 }

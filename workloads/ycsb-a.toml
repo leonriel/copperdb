@@ -1,0 +1,12 @@
+# YCSB-A — 50% read / 50% update, Zipfian-skewed access.
+#
+# Update-heavy workload that mirrors a session-store: each operation either
+# fetches the session or writes a new value, with a small set of hot keys.
+
+name = "YCSB-A"
+description = "50/50 read/update with Zipfian-skewed access (update-heavy)"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "zipfian"
+zipfian_theta = 0.99
+op_mix = { read = 0.5, update = 0.5, insert = 0.0, rmw = 0.0 }
