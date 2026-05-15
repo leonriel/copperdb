@@ -735,4 +735,65 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// A high-cardinality workload — thousands of distinct keys — must
+    /// flush and compact without errors. Pre-Option-B the SSTable index
+    /// block was capped at 4 KB; merging multiple L0 files of distinct
+    /// keys yielded an L1 output whose index overflowed, so compaction
+    /// silently failed and L0 grew unboundedly. The existing stress
+    /// tests miss this because they hammer 30–50 keys repeatedly — after
+    /// dedup, merged outputs are tiny.
+    #[test]
+    fn compaction_handles_high_cardinality_distinct_keys() {
+        const SMALL_MEMTABLE: usize = 32 * 1024;
+        const NUM_KEYS: u64 = 4_000;
+        const VALUE_SIZE: usize = 256;
+
+        let dir = tmp_dir();
+        let engine = LsmEngine::open_with_memtable_size(&dir, SMALL_MEMTABLE).unwrap();
+
+        for i in 0u64..NUM_KEYS {
+            let key = format!("key_{:08}", i);
+            let val = vec![i as u8; VALUE_SIZE];
+            engine.put(key, val).unwrap();
+        }
+
+        // Give the flusher + compactor time to drain. Compactions cascade,
+        // so this must be long enough for at least one L0→L1 pass.
+        std::thread::sleep(Duration::from_secs(5));
+
+        let version = engine.current_version();
+        let l0 = version.files_at_level(0).len();
+        let l1 = version.files_at_level(1).len();
+
+        // Structural invariant: compaction must have produced L1 output.
+        // If compaction silently failed (as it did pre-fix), L1 would be
+        // empty and L0 would balloon past the trigger.
+        assert!(
+            l1 > 0,
+            "expected at least one L1 file after compaction; L0={}",
+            l0,
+        );
+        assert!(
+            l0 <= L0_COMPACTION_TRIGGER * 2,
+            "L0 file count ({}) exceeded 2× compaction trigger ({}); compaction \
+             likely failed silently",
+            l0,
+            L0_COMPACTION_TRIGGER,
+        );
+
+        // Correctness: every key must still read back. Pre-fix this assertion
+        // passes even with broken compaction because L0 still holds the data;
+        // we include it as a sanity check on the structural assertions above.
+        for i in 0u64..NUM_KEYS {
+            let key = format!("key_{:08}", i);
+            let got = engine.get(&key);
+            assert_eq!(
+                got.as_deref().map(|v| v.len()),
+                Some(VALUE_SIZE),
+                "missing or wrong-sized value for {}",
+                key,
+            );
+        }
+    }
 }
