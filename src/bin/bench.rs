@@ -1,11 +1,15 @@
-//! copperdb benchmark harness (Phase 2).
+//! copperdb benchmark harness (Phase 3).
 //!
-//! Single-threaded driver supporting Zipfian / uniform / latest key
-//! distributions and a configurable op mix (read / update / insert /
-//! read-modify-write). Workloads can be supplied either as a TOML preset
-//! (`--config workloads/ycsb-a.toml`) or via individual CLI flags.
+//! Multi-threaded driver with optional rate-targeted closed loop and
+//! coordinated-omission correction. Workloads can be supplied either as a
+//! TOML preset (`--config workloads/ycsb-a.toml`) or via individual CLI
+//! flags. Per-op-kind latency histograms are reported separately so reads
+//! and writes can be analysed in isolation.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -189,7 +193,7 @@ struct Args {
     dir: PathBuf,
 
     /// Path to a TOML workload preset (see workloads/). When set, the
-    /// workload-detail flags below are ignored.
+    /// workload-detail flags below are overrides on top of the preset.
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -206,14 +210,22 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     cooldown: u64,
 
-    /// Memtable size in bytes. 200 KB by default to stay within the SSTable
-    /// writer's per-flush index budget.
+    /// Memtable size in bytes.
     #[arg(long, default_value_t = 200 * 1024)]
     memtable_size: usize,
 
-    // -- Workload-detail overrides. When --config is set, these override
-    // individual fields of the loaded TOML. When --config is absent, missing
-    // values fall back to the built-in defaults in `default_workload()`. --
+    /// Number of concurrent worker threads driving the run phase.
+    #[arg(long, default_value_t = 1)]
+    threads: u32,
+
+    /// Optional total target rate across all threads, in ops/sec. When set,
+    /// switches to closed-loop mode with coordinated-omission correction.
+    /// When absent, the run is open-loop max (each thread fires ops as fast
+    /// as the engine accepts).
+    #[arg(long)]
+    target_rate: Option<f64>,
+
+    // -- Workload-detail overrides. --
     /// Number of keys to load before the run phase.
     #[arg(long)]
     keys: Option<u64>,
@@ -234,12 +246,11 @@ struct Args {
     #[arg(long)]
     read_pct: Option<f64>,
 
-    /// Fraction of ops that are updates (writes to an existing key).
+    /// Fraction of ops that are updates.
     #[arg(long)]
     update_pct: Option<f64>,
 
-    /// Fraction of ops that are inserts (writes to a new key, growing the
-    /// key space).
+    /// Fraction of ops that are inserts (grows the key space).
     #[arg(long)]
     insert_pct: Option<f64>,
 
@@ -308,6 +319,14 @@ fn resolve_workload(args: &Args) -> Result<Workload, Box<dyn std::error::Error>>
     if workload.keys == 0 {
         return Err("workload.keys must be > 0".into());
     }
+    if args.threads == 0 {
+        return Err("--threads must be > 0".into());
+    }
+    if let Some(r) = args.target_rate {
+        if r <= 0.0 {
+            return Err("--target-rate must be > 0".into());
+        }
+    }
     Ok(workload)
 }
 
@@ -322,6 +341,183 @@ fn make_key(i: u64) -> String {
 fn make_value(rng: &mut SmallRng, size: usize, buf: &mut Vec<u8>) {
     buf.resize(size, 0);
     rng.fill(&mut buf[..]);
+}
+
+// ---------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------
+
+struct ThreadResult {
+    reads: u64,
+    updates: u64,
+    inserts: u64,
+    rmws: u64,
+    read_hits: u64,
+    read_hist: Histogram<u64>,
+    update_hist: Histogram<u64>,
+    insert_hist: Histogram<u64>,
+    rmw_hist: Histogram<u64>,
+}
+
+/// Drive the run phase from a single worker thread until the deadline.
+///
+/// `per_thread_rate = Some(r)` ⇒ closed-loop mode, schedule ops at fixed
+/// intervals `1/r` and use coordinated-omission correction. `None` ⇒
+/// open-loop max (fire ops as fast as the engine accepts).
+fn run_worker(
+    thread_id: u32,
+    engine: Arc<LsmEngine>,
+    workload: Workload,
+    next_insert_idx: Arc<AtomicU64>,
+    seed: u64,
+    run_start: Instant,
+    deadline: Instant,
+    per_thread_rate: Option<f64>,
+) -> Result<ThreadResult, String> {
+    let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(thread_id as u64));
+    let key_sampler = KeySampler::new(
+        workload.key_distribution,
+        workload.keys,
+        workload.zipfian_theta,
+    )?;
+    let op_sampler = OpSampler::new(&workload.op_mix);
+    let mut value_buf: Vec<u8> = Vec::with_capacity(workload.value_size);
+
+    let mut read_hist: Histogram<u64> = Histogram::new(3).map_err(|e| e.to_string())?;
+    let mut update_hist: Histogram<u64> = Histogram::new(3).map_err(|e| e.to_string())?;
+    let mut insert_hist: Histogram<u64> = Histogram::new(3).map_err(|e| e.to_string())?;
+    let mut rmw_hist: Histogram<u64> = Histogram::new(3).map_err(|e| e.to_string())?;
+
+    let mut reads: u64 = 0;
+    let mut updates: u64 = 0;
+    let mut inserts: u64 = 0;
+    let mut rmws: u64 = 0;
+    let mut read_hits: u64 = 0;
+
+    // Per-thread interval in nanoseconds for closed-loop scheduling.
+    let interval_ns: Option<u64> = per_thread_rate.map(|r| (1e9 / r).max(1.0) as u64);
+
+    let mut iteration: u64 = 0;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        // Closed-loop scheduling: compute the intended fire time for this
+        // iteration. If we're ahead, sleep; if we're behind, fire immediately
+        // and let `record_correct` backfill missed intervals.
+        let intended: Option<Instant> = interval_ns.map(|ivl| {
+            run_start + Duration::from_nanos(iteration.saturating_mul(ivl))
+        });
+        if let Some(t) = intended {
+            if let Some(wait) = t.checked_duration_since(now) {
+                thread::sleep(wait);
+            }
+        }
+
+        // Sample the op and current key-space size.
+        let op = op_sampler.sample(rng.random::<f64>());
+        let n_current = next_insert_idx.load(Ordering::Relaxed);
+
+        let op_started = Instant::now();
+        let kind = match op {
+            OpKind::Read => {
+                let k = make_key(key_sampler.sample(&mut rng, n_current));
+                let got = engine.get(&k);
+                if got.is_some() {
+                    read_hits += 1;
+                }
+                reads += 1;
+                OpKind::Read
+            }
+            OpKind::Update => {
+                let k = make_key(key_sampler.sample(&mut rng, n_current));
+                make_value(&mut rng, workload.value_size, &mut value_buf);
+                engine.put(k, value_buf.clone()).map_err(|e| e.to_string())?;
+                updates += 1;
+                OpKind::Update
+            }
+            OpKind::Insert => {
+                let idx = next_insert_idx.fetch_add(1, Ordering::Relaxed);
+                let k = make_key(idx);
+                make_value(&mut rng, workload.value_size, &mut value_buf);
+                engine.put(k, value_buf.clone()).map_err(|e| e.to_string())?;
+                inserts += 1;
+                OpKind::Insert
+            }
+            OpKind::Rmw => {
+                let k = make_key(key_sampler.sample(&mut rng, n_current));
+                let _ = engine.get(&k);
+                make_value(&mut rng, workload.value_size, &mut value_buf);
+                engine.put(k, value_buf.clone()).map_err(|e| e.to_string())?;
+                rmws += 1;
+                OpKind::Rmw
+            }
+        };
+        let op_complete = Instant::now();
+
+        // Latency: from the intended fire time in closed-loop, else from the
+        // actual start. `saturating_duration_since` keeps this safe if the
+        // sleep slightly overshot.
+        let latency_ns = match intended {
+            Some(t) => op_complete.saturating_duration_since(t).as_nanos() as u64,
+            None => op_complete.duration_since(op_started).as_nanos() as u64,
+        };
+
+        let hist = match kind {
+            OpKind::Read => &mut read_hist,
+            OpKind::Update => &mut update_hist,
+            OpKind::Insert => &mut insert_hist,
+            OpKind::Rmw => &mut rmw_hist,
+        };
+        match interval_ns {
+            Some(ivl) => hist
+                .record_correct(latency_ns, ivl)
+                .map_err(|e| e.to_string())?,
+            None => hist.record(latency_ns).map_err(|e| e.to_string())?,
+        }
+
+        iteration += 1;
+    }
+
+    Ok(ThreadResult {
+        reads,
+        updates,
+        inserts,
+        rmws,
+        read_hits,
+        read_hist,
+        update_hist,
+        insert_hist,
+        rmw_hist,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Report helpers
+// ---------------------------------------------------------------------------
+
+fn print_per_op_block(label: &str, count: u64, hist: &Histogram<u64>) {
+    if count == 0 || hist.len() == 0 {
+        println!("  {} (no samples)", label);
+        return;
+    }
+    println!(
+        "  {} ({} ops):",
+        label,
+        count,
+    );
+    println!(
+        "    p50={:>10}  p95={:>10}  p99={:>10}  p99.9={:>10}  p99.99={:>10}  max={:>10}  mean={:>10.0}",
+        hist.value_at_quantile(0.50),
+        hist.value_at_quantile(0.95),
+        hist.value_at_quantile(0.99),
+        hist.value_at_quantile(0.999),
+        hist.value_at_quantile(0.9999),
+        hist.max(),
+        hist.mean(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -341,13 +537,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[bench] opening copperdb at {:?} (memtable={} B)",
         args.dir, args.memtable_size,
     );
-    let engine: std::sync::Arc<LsmEngine> =
+    let engine: Arc<LsmEngine> =
         LsmEngine::open_with_memtable_size(&args.dir, args.memtable_size)?;
 
     let mut rng = SmallRng::seed_from_u64(args.seed);
     let mut value_buf: Vec<u8> = Vec::with_capacity(workload.value_size);
 
-    // ---- Load phase -----------------------------------------------------
+    // ---- Load phase (single-threaded) -----------------------------------
     eprintln!("[bench] load phase: inserting {} keys", workload.keys);
     let load_start = Instant::now();
     for i in 0..workload.keys {
@@ -367,80 +563,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[bench] cooldown {}s (let background work drain)",
             args.cooldown,
         );
-        std::thread::sleep(Duration::from_secs(args.cooldown));
+        thread::sleep(Duration::from_secs(args.cooldown));
     }
 
-    // ---- Run phase ------------------------------------------------------
+    // ---- Run phase (multi-threaded) -------------------------------------
+    let per_thread_rate = args.target_rate.map(|r| r / args.threads as f64);
+    let mode_str = match per_thread_rate {
+        Some(r) => format!(
+            "closed-loop (target {} ops/sec total, {:.0} per thread)",
+            args.target_rate.unwrap(),
+            r,
+        ),
+        None => "open-loop max".to_string(),
+    };
     eprintln!(
-        "[bench] run phase: {}s @ distribution={:?} mix={:?}",
-        args.duration, workload.key_distribution, workload.op_mix,
+        "[bench] run phase: {}s, {} threads, mode={}",
+        args.duration, args.threads, mode_str,
     );
 
-    let key_sampler =
-        KeySampler::new(workload.key_distribution, workload.keys, workload.zipfian_theta)?;
-    let op_sampler = OpSampler::new(&workload.op_mix);
-
-    let mut hist: Histogram<u64> = Histogram::new(3)?;
-
+    let next_insert_idx = Arc::new(AtomicU64::new(workload.keys));
     let run_start = Instant::now();
-    let run_deadline = run_start + Duration::from_secs(args.duration);
+    let deadline = run_start + Duration::from_secs(args.duration);
 
-    let mut next_insert_idx: u64 = workload.keys;
-    let mut n_current: u64 = workload.keys;
+    let mut handles = Vec::with_capacity(args.threads as usize);
+    for t in 0..args.threads {
+        let engine = Arc::clone(&engine);
+        let workload = workload.clone();
+        let next_insert_idx = Arc::clone(&next_insert_idx);
+        let seed = args.seed;
+        handles.push(thread::spawn(move || {
+            run_worker(
+                t,
+                engine,
+                workload,
+                next_insert_idx,
+                seed,
+                run_start,
+                deadline,
+                per_thread_rate,
+            )
+        }));
+    }
+
+    let mut combined_read: Histogram<u64> = Histogram::new(3)?;
+    let mut combined_update: Histogram<u64> = Histogram::new(3)?;
+    let mut combined_insert: Histogram<u64> = Histogram::new(3)?;
+    let mut combined_rmw: Histogram<u64> = Histogram::new(3)?;
     let mut reads = 0u64;
     let mut updates = 0u64;
     let mut inserts = 0u64;
     let mut rmws = 0u64;
     let mut read_hits = 0u64;
 
-    while Instant::now() < run_deadline {
-        let op = op_sampler.sample(rng.random::<f64>());
-        match op {
-            OpKind::Read => {
-                let k = make_key(key_sampler.sample(&mut rng, n_current));
-                let t = Instant::now();
-                let got = engine.get(&k);
-                let elapsed_ns = t.elapsed().as_nanos() as u64;
-                hist.record(elapsed_ns)?;
-                if got.is_some() {
-                    read_hits += 1;
-                }
-                reads += 1;
-            }
-            OpKind::Update => {
-                let k = make_key(key_sampler.sample(&mut rng, n_current));
-                make_value(&mut rng, workload.value_size, &mut value_buf);
-                let t = Instant::now();
-                engine.put(k, value_buf.clone())?;
-                let elapsed_ns = t.elapsed().as_nanos() as u64;
-                hist.record(elapsed_ns)?;
-                updates += 1;
-            }
-            OpKind::Insert => {
-                let k = make_key(next_insert_idx);
-                next_insert_idx += 1;
-                n_current = next_insert_idx;
-                make_value(&mut rng, workload.value_size, &mut value_buf);
-                let t = Instant::now();
-                engine.put(k, value_buf.clone())?;
-                let elapsed_ns = t.elapsed().as_nanos() as u64;
-                hist.record(elapsed_ns)?;
-                inserts += 1;
-            }
-            OpKind::Rmw => {
-                let k = make_key(key_sampler.sample(&mut rng, n_current));
-                let t = Instant::now();
-                let _ = engine.get(&k);
-                make_value(&mut rng, workload.value_size, &mut value_buf);
-                engine.put(k, value_buf.clone())?;
-                let elapsed_ns = t.elapsed().as_nanos() as u64;
-                hist.record(elapsed_ns)?;
-                rmws += 1;
-            }
-        }
+    for h in handles {
+        let result = h
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())??;
+        combined_read.add(result.read_hist)?;
+        combined_update.add(result.update_hist)?;
+        combined_insert.add(result.insert_hist)?;
+        combined_rmw.add(result.rmw_hist)?;
+        reads += result.reads;
+        updates += result.updates;
+        inserts += result.inserts;
+        rmws += result.rmws;
+        read_hits += result.read_hits;
     }
+
     let run_elapsed = run_start.elapsed();
     let total_ops = reads + updates + inserts + rmws;
+    let n_final = next_insert_idx.load(Ordering::Relaxed);
 
     // ---- Report ---------------------------------------------------------
     let pct = |n: u64| -> f64 {
@@ -470,6 +662,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("config:");
     println!("  dir:         {:?}", args.dir);
+    println!("  threads:     {}", args.threads);
+    println!("  mode:        {}", mode_str);
     println!("  duration:    {}s", args.duration);
     println!("  memtable:    {} B", args.memtable_size);
     println!("  seed:        {}", args.seed);
@@ -497,21 +691,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  rmw:         {} ({:.1}%)", rmws, pct(rmws));
     println!(
         "  key space:   {} (initial) → {} (final)",
-        workload.keys, n_current,
+        workload.keys, n_final,
     );
     println!(
         "  throughput:  {:.0} ops/sec",
         total_ops as f64 / run_elapsed.as_secs_f64(),
     );
     println!();
-    println!("latency (ns, all ops):");
-    println!("  p50:    {:>12}", hist.value_at_quantile(0.50));
-    println!("  p95:    {:>12}", hist.value_at_quantile(0.95));
-    println!("  p99:    {:>12}", hist.value_at_quantile(0.99));
-    println!("  p99.9:  {:>12}", hist.value_at_quantile(0.999));
-    println!("  p99.99: {:>12}", hist.value_at_quantile(0.9999));
-    println!("  max:    {:>12}", hist.max());
-    println!("  mean:   {:>12.0}", hist.mean());
+    println!("latency (ns), per op kind:");
+    print_per_op_block("reads  ", reads, &combined_read);
+    print_per_op_block("updates", updates, &combined_update);
+    print_per_op_block("inserts", inserts, &combined_insert);
+    print_per_op_block("rmw    ", rmws, &combined_rmw);
 
     Ok(())
 }
