@@ -51,8 +51,9 @@ pub enum CompactionError {
 // ---------------------------------------------------------------------------
 
 /// Reads an SSTable file block-by-block and yields every (key, record, seq_num)
-/// entry in on-disk (sorted) order. Used as one input stream to `MergingIterator`.
-struct SsTableIterator {
+/// entry in on-disk (sorted) order. Used as one input stream to `MergingIterator`
+/// — both by the compactor and by `LsmEngine::scan`.
+pub(crate) struct SsTableIterator {
     file: File,
     /// Byte ranges for each data block: (start_inclusive, end_exclusive).
     block_ranges: Vec<(u64, u64)>,
@@ -65,7 +66,7 @@ struct SsTableIterator {
 }
 
 impl SsTableIterator {
-    fn open(path: &Path) -> Result<Self, CompactionError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, CompactionError> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -291,13 +292,14 @@ impl PartialOrd for HeapEntry {
 }
 
 /// Merges N sorted iterators into one sorted stream using a binary min-heap.
-struct MergingIterator {
+/// Used by the compactor and by `LsmEngine::scan`.
+pub(crate) struct MergingIterator {
     iterators: Vec<Box<dyn KvIterator>>,
     heap: BinaryHeap<HeapEntry>,
 }
 
 impl MergingIterator {
-    fn new(mut iterators: Vec<Box<dyn KvIterator>>) -> Self {
+    pub(crate) fn new(mut iterators: Vec<Box<dyn KvIterator>>) -> Self {
         let mut heap = BinaryHeap::with_capacity(iterators.len());
 
         for (idx, iter) in iterators.iter_mut().enumerate() {

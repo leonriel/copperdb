@@ -134,6 +134,18 @@ mod tests {
             self.inner.lock().unwrap().remove(&key);
             Ok(())
         }
+
+        async fn scan(
+            &self,
+            _start: std::ops::Bound<String>,
+            _end: std::ops::Bound<String>,
+            _limit: usize,
+        ) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
+            // The router does not (yet) expose `/scan`, so this mock impl is
+            // unused. Returns empty rather than panicking so any future
+            // accidental call from a test still produces a well-formed result.
+            Ok(Vec::new())
+        }
     }
 
     fn router_with(engine: Arc<MockEngine>) -> Router {
