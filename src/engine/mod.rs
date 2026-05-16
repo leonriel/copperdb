@@ -45,6 +45,26 @@ pub struct EngineCore {
     /// Signals background workers to exit on their next loop iteration.
     /// Set by `LsmEngine::drop` together with a wake-up on each channel.
     pub(crate) shutdown: AtomicBool,
+
+    // ---- Diagnostic counters (read via `LsmEngine::stats`) ----
+    // These are fire-and-forget; Relaxed ordering is correct because they
+    // don't synchronise any other state.
+    pub(crate) total_writes:          AtomicU64,
+    pub(crate) total_flushes:         AtomicU64,
+    pub(crate) total_compactions:     AtomicU64,
+    pub(crate) in_flight_compactions: AtomicU64,
+}
+
+/// Read-only snapshot of engine-side counters and live state. Returned by
+/// `LsmEngine::stats()` for diagnostic / time-series instrumentation.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineStats {
+    pub total_writes:          u64,
+    pub total_flushes:         u64,
+    pub total_compactions:     u64,
+    pub in_flight_compactions: u64,
+    pub l0_file_count:         usize,
+    pub immutable_queue_depth: usize,
 }
 
 /// Core engine: coordinates WAL writes and MemTable inserts.
@@ -157,6 +177,10 @@ impl LsmEngine {
             next_sst_id:  AtomicU64::new(next_sst_id),
             flush_tx,
             shutdown:     AtomicBool::new(false),
+            total_writes:          AtomicU64::new(0),
+            total_flushes:         AtomicU64::new(0),
+            total_compactions:     AtomicU64::new(0),
+            in_flight_compactions: AtomicU64::new(0),
         });
 
         // Workers hold a strong Arc<EngineCore> so the shared state stays alive
@@ -202,6 +226,7 @@ impl EngineCore {
             self.rotate_wal_and_memtable(expected_id)?;
         }
 
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -306,7 +331,23 @@ impl EngineCore {
         if let Some(expected_id) = self.state.put(key, Record::Delete, seq) {
             self.rotate_wal_and_memtable(expected_id)?;
         }
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Read-only snapshot of engine counters and live state. Used by the
+    /// benchmark harness for diagnostic time-series output; cheap enough to
+    /// call once per second.
+    pub fn stats(&self) -> EngineStats {
+        let v = self.current_version();
+        EngineStats {
+            total_writes:          self.total_writes.load(Ordering::Relaxed),
+            total_flushes:         self.total_flushes.load(Ordering::Relaxed),
+            total_compactions:     self.total_compactions.load(Ordering::Relaxed),
+            in_flight_compactions: self.in_flight_compactions.load(Ordering::Relaxed),
+            l0_file_count:         v.files_at_level(0).len(),
+            immutable_queue_depth: self.state.immutable_queue_depth(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1136,5 +1177,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `stats()` reports a sensible snapshot for a freshly-opened engine
+    /// that's only seen a few writes — no flushes, no in-flight compactions,
+    /// `total_writes >= n`. This is the lowest-effort guard that confirms
+    /// the counters are wired into `put`/`delete` and surface through the
+    /// public API.
+    #[test]
+    fn stats_reports_writes_without_flush_or_compaction() {
+        let dir = tmp_dir();
+        // Default memtable is well over our smallish write volume, so no
+        // flush is triggered. With no flush there's no compaction either.
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        const N: u64 = 5;
+        for i in 0..N {
+            engine
+                .put(format!("k{}", i), vec![i as u8; 16])
+                .unwrap();
+        }
+        engine.delete("k0".to_string()).unwrap();
+
+        let stats = engine.stats();
+        assert!(stats.total_writes >= N + 1, "puts + 1 delete should count");
+        assert_eq!(stats.total_flushes, 0, "no flush at this write volume");
+        assert_eq!(stats.total_compactions, 0);
+        assert_eq!(stats.in_flight_compactions, 0);
+        assert_eq!(stats.l0_file_count, 0);
+        assert_eq!(stats.immutable_queue_depth, 0);
     }
 }

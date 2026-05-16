@@ -66,6 +66,7 @@ fn flush_pending(engine: &EngineCore) {
         }
 
         engine.state.drop_immutable(&table);
+        engine.total_flushes.fetch_add(1, Ordering::Relaxed);
 
         // The immutable table's ID equals the WAL generation number it was
         // paired with (assigned in LsmEngine::rotate_wal_and_memtable).
