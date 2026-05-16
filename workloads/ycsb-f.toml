@@ -1,0 +1,12 @@
+# YCSB-F — 50% read / 50% read-modify-write, Zipfian.
+#
+# Each RMW reads a record, modifies it, and writes it back. Models user-record
+# updates where the new value depends on the old.
+
+name = "YCSB-F"
+description = "Read / read-modify-write mix; Zipfian-skewed access"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "zipfian"
+zipfian_theta = 0.99
+op_mix = { read = 0.5, update = 0.0, insert = 0.0, rmw = 0.5 }

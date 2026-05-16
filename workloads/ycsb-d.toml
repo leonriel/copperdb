@@ -1,0 +1,12 @@
+# YCSB-D — 95% read / 5% insert, Latest distribution.
+#
+# Read-mostly with new-record inserts; reads are biased toward the most
+# recently inserted keys. Models a news-feed or status-update workload.
+
+name = "YCSB-D"
+description = "Read-mostly with new-record inserts; reads biased toward latest keys"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "latest"
+zipfian_theta = 0.99
+op_mix = { read = 0.95, update = 0.0, insert = 0.05, rmw = 0.0 }

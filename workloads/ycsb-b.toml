@@ -1,0 +1,12 @@
+# YCSB-B — 95% read / 5% update, Zipfian.
+#
+# Read-mostly with light updates; representative of photo-tagging / social
+# read-heavy workloads.
+
+name = "YCSB-B"
+description = "Read-mostly with light updates; Zipfian-skewed access"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "zipfian"
+zipfian_theta = 0.99
+op_mix = { read = 0.95, update = 0.05, insert = 0.0, rmw = 0.0 }
