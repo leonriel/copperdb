@@ -108,6 +108,12 @@ impl MemTableState {
         guard.immutable.len() >= guard.max_immutable_tables
     }
 
+    /// Number of frozen memtables currently waiting to be flushed.
+    /// Used by `LsmEngine::stats()` for diagnostic time-series output.
+    pub fn immutable_queue_depth(&self) -> usize {
+        self.inner.read().unwrap().immutable.len()
+    }
+
     /// Blocks the calling thread until the immutable queue drops below the
     /// backpressure threshold. Returns `true` if the wait completed normally,
     /// `false` if the timeout expired while still stalled.

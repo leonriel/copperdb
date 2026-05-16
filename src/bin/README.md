@@ -108,6 +108,7 @@ remain useful for quick smoke tests during development.
 | `--seed <u64>`      | `42`         | PRNG seed. Each thread uses `seed + thread_id`.                    |
 | `--cooldown <secs>` | `1`          | Sleep between load and run phases so background work drains.       |
 | `--memtable-size`   | `204800`     | Memtable byte budget. 200 KB default keeps flushes brisk for development; raise for larger runs. |
+| `--csv <path>`      | (off)        | Per-second time-series CSV: throughput, latency percentiles, engine counters. |
 
 ### Workload flags (CLI or TOML)
 
@@ -186,13 +187,42 @@ cargo run --release --bin bench -- --dir /tmp/sustain --config workloads/ycsb-c.
 # Compare the per-op-kind P99.9 between (1) and (2).
 ```
 
+## Time-series CSV (`--csv`)
+
+`--csv <path>` writes one row per second of the run phase to a CSV file
+containing throughput, latency percentiles, and engine counters at that
+instant. Useful for plotting `p99_ns` vs `l0_files` to see *when* a tail
+spike happened and *what was going on inside the engine* at the time.
+
+```sh
+cargo run --release --bin bench -- \
+    --dir /tmp/bench-csv \
+    --config workloads/ycsb-a.toml \
+    --threads 4 \
+    --duration 60 \
+    --csv ycsb-a.csv
+```
+
+Columns:
+
+| Column                  | Meaning                                                          |
+|-------------------------|------------------------------------------------------------------|
+| `t_sec`                 | Second-index relative to run start (0, 1, 2, …).                 |
+| `ops`                   | Total ops the workers completed during this second.              |
+| `p50_ns` / `p99_ns` / `p999_ns` / `max_ns` | Latency percentiles for ops in this window. |
+| `l0_files`              | L0 file count at this instant (from `LsmEngine::stats`).         |
+| `immutable_q`           | Immutable memtable queue depth.                                  |
+| `in_flight_compactions` | Active compactions at this instant.                              |
+| `total_flushes`         | Cumulative flush count since process start.                      |
+| `total_compactions`     | Cumulative compaction count since process start.                 |
+
+The per-second percentiles in the CSV are recorded from *actual* op
+latencies — they don't apply coordinated-omission correction (that's
+preserved in the full-run summary). The intent of the CSV is to localise
+spikes in time; the summary is the authoritative tail-latency view.
+
 ## Known gaps
 
-- **No time-series output.** Each run reports a single summary; you can't see
-  throughput or P99 over time. Phase 4 will add a per-second CSV.
-- **No engine counter snapshots.** When tail latency spikes, the harness
-  doesn't yet tell you whether a compaction or an L0 fan-out caused it.
-  Phase 4 will plumb `LsmEngine::stats()`.
 - **Sleep precision on macOS.** See the closed-loop caveat above. Linux is
   the answer.
 - **No `scan` workload (YCSB-E).** `LsmEngine` has no public `scan` API;

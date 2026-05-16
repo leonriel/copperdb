@@ -408,6 +408,11 @@ fn compact_level(
     version: &VersionState,
     level: usize,
 ) -> Result<(), CompactionError> {
+    // Mark this compaction as in-flight for the duration of the call. Drop
+    // fires on every exit path (success, error, early return) so the count
+    // stays consistent even if `?` propagates an error mid-function.
+    let _in_flight = InFlightGuard::new(&engine.in_flight_compactions);
+
     let output_level = level + 1;
 
     // Pick victim files from `level`.
@@ -468,6 +473,7 @@ fn compact_level(
         .collect();
 
     engine.record_compaction(&removed, &output_files)?;
+    engine.total_compactions.fetch_add(1, AtomicOrdering::Relaxed);
 
     // Files are unlinked via `Arc<SstFileGuard>` refcounts: `apply(RemoveFile)`
     // marks the guard, and the actual `remove_file` syscall fires when the
@@ -475,6 +481,26 @@ fn compact_level(
     // is released by readers). No manual cleanup needed here.
 
     Ok(())
+}
+
+/// RAII guard that increments an `AtomicU64` on construction and decrements
+/// on drop. Used to track `in_flight_compactions` consistently across all
+/// exit paths of `compact_level`.
+struct InFlightGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl<'a> Drop for InFlightGuard<'a> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Returns `true` when `level` is the deepest level that currently holds files.
