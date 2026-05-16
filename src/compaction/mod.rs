@@ -108,50 +108,83 @@ impl SsTableIterator {
             )));
         }
 
-        // Read the index block (sits between meta block and footer).
-        let index_size = file_len
+        // Read the top index block (sits between the last L1 block and the
+        // footer; `index_offset` in the footer now means top-index offset).
+        let top_index_offset = index_offset;
+        let top_index_size = file_len
             .saturating_sub(FOOTER_SIZE as u64)
-            .saturating_sub(index_offset) as usize;
+            .saturating_sub(top_index_offset) as usize;
 
-        file.seek(SeekFrom::Start(index_offset))?;
-        let mut index_data = vec![0u8; index_size];
-        file.read_exact(&mut index_data)?;
+        file.seek(SeekFrom::Start(top_index_offset))?;
+        let mut top_index_data = vec![0u8; top_index_size];
+        file.read_exact(&mut top_index_data)?;
+        let top_index = Block::decode(top_index_data);
 
-        let index_block = Block::decode(index_data);
-        let num_index_entries = index_block
+        // Helper: decode an 8-byte big-endian u64 offset from an index entry.
+        let decode_offset = |record: Record| -> Result<u64, CompactionError> {
+            match record {
+                Record::Put(v) => {
+                    let arr: [u8; 8] = v.try_into().map_err(|_| {
+                        CompactionError::SSTable("Index pointer is not 8 bytes".to_string())
+                    })?;
+                    Ok(u64::from_be_bytes(arr))
+                }
+                Record::Delete => Err(CompactionError::SSTable(
+                    "Index block contains a Delete record".to_string(),
+                )),
+            }
+        };
+
+        // Walk the top index → for each L1 entry, read that L1 block from
+        // disk and collect every data-block offset it points at.
+        let n_top = top_index
             .get_num_offsets()
             .map_err(|e| CompactionError::SSTable(e.to_string()))?;
 
-        // Collect the start byte of each data block from the index.
-        let mut block_starts: Vec<u64> = Vec::with_capacity(num_index_entries);
-        for i in 0..num_index_entries {
-            let entry_offset = index_block
-                .get_offset(i, num_index_entries)
+        let mut block_starts: Vec<u64> = Vec::new();
+        for top_i in 0..n_top {
+            let top_entry_offset = top_index
+                .get_offset(top_i, n_top)
                 .map_err(|e| CompactionError::SSTable(e.to_string()))?;
-
-            let (_, record) = index_block
-                .decode_entry(entry_offset)
+            let (_, top_record) = top_index
+                .decode_entry(top_entry_offset)
                 .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+            let l1_start = decode_offset(top_record)?;
 
-            let block_start = match record {
-                Record::Put(v) => {
-                    let arr: [u8; 8] = v.try_into().map_err(|_| {
-                        CompactionError::SSTable(
-                            "Index block pointer is not 8 bytes".to_string(),
-                        )
-                    })?;
-                    u64::from_be_bytes(arr)
-                }
-                Record::Delete => {
-                    return Err(CompactionError::SSTable(
-                        "Index block contains a Delete record".to_string(),
-                    ));
-                }
+            let l1_end = if top_i + 1 < n_top {
+                let next_top_entry_offset = top_index
+                    .get_offset(top_i + 1, n_top)
+                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                let (_, next_top_record) = top_index
+                    .decode_entry(next_top_entry_offset)
+                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                decode_offset(next_top_record)?
+            } else {
+                top_index_offset
             };
-            block_starts.push(block_start);
+
+            let l1_size = (l1_end - l1_start) as usize;
+            file.seek(SeekFrom::Start(l1_start))?;
+            let mut l1_data = vec![0u8; l1_size];
+            file.read_exact(&mut l1_data)?;
+            let l1_block = Block::decode(l1_data);
+
+            let n_l1 = l1_block
+                .get_num_offsets()
+                .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+            for j in 0..n_l1 {
+                let entry_offset = l1_block
+                    .get_offset(j, n_l1)
+                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                let (_, record) = l1_block
+                    .decode_entry(entry_offset)
+                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                block_starts.push(decode_offset(record)?);
+            }
         }
 
-        // Build (start, end) ranges. The last block ends where the index block begins.
+        // Build (start, end) ranges. The last data block ends where the meta
+        // block begins.
         let mut block_ranges: Vec<(u64, u64)> = Vec::with_capacity(block_starts.len());
         for (i, &start) in block_starts.iter().enumerate() {
             let end = if i + 1 < block_starts.len() {
@@ -736,17 +769,89 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A high-cardinality workload — thousands of distinct keys — must
-    /// flush and compact without errors. Pre-Option-B the SSTable index
-    /// block was capped at 4 KB; merging multiple L0 files of distinct
-    /// keys yielded an L1 output whose index overflowed, so compaction
-    /// silently failed and L0 grew unboundedly. The existing stress
-    /// tests miss this because they hammer 30–50 keys repeatedly — after
-    /// dedup, merged outputs are tiny.
+    /// `SsTableIterator` must walk both index levels — it can't assume the
+    /// single-level layout. Builds a file whose L1 index spans multiple
+    /// blocks (enough distinct keys to overflow the 64 KB L1 target), then
+    /// iterates it end-to-end and verifies entry count + sorted order.
+    #[test]
+    fn sstable_iterator_walks_multi_l1() {
+        use std::sync::atomic::AtomicUsize;
+
+        static CNT: AtomicUsize = AtomicUsize::new(0);
+        let id = CNT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "iter_multi_l1_{}_{}.sst",
+            std::process::id(),
+            id,
+        ));
+
+        struct SliceIter {
+            inner: std::vec::IntoIter<(String, Record, u64)>,
+        }
+        impl KvIterator for SliceIter {
+            fn is_valid(&self) -> bool {
+                false
+            }
+            fn next(&mut self) -> Option<(String, Record, u64)> {
+                self.inner.next()
+            }
+        }
+
+        // 30k entries × 256B values = ~7.5 MB of data → ~7,500 data blocks
+        // → ~370 KB of L1 index → ~6 L1 blocks at the 64 KB L1 target.
+        const NUM_KEYS: u32 = 30_000;
+        const VALUE_SIZE: usize = 256;
+
+        let entries: Vec<(String, Record, u64)> = (0..NUM_KEYS)
+            .map(|i| {
+                (
+                    format!("key_{:020}", i),
+                    Record::Put(vec![(i % 256) as u8; VALUE_SIZE]),
+                    (NUM_KEYS - i) as u64,
+                )
+            })
+            .collect();
+
+        {
+            let mut builder = SsTableBuilder::new(path.to_str().unwrap()).unwrap();
+            builder
+                .build_from_iterator(Box::new(SliceIter {
+                    inner: entries.clone().into_iter(),
+                }))
+                .unwrap();
+        }
+
+        let mut iter = SsTableIterator::open(&path).unwrap();
+        let mut yielded: Vec<(String, u64)> = Vec::new();
+        while let Some((k, _, seq)) = iter.next() {
+            yielded.push((k, seq));
+        }
+
+        assert_eq!(
+            yielded.len(),
+            entries.len(),
+            "iterator must yield every entry across L1 boundaries",
+        );
+
+        // Confirm sorted-by-key order is preserved across L1 boundaries.
+        let expected_keys: Vec<String> =
+            entries.iter().map(|(k, _, _)| k.clone()).collect();
+        let actual_keys: Vec<String> = yielded.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(actual_keys, expected_keys);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A high-cardinality workload — tens of thousands of distinct keys —
+    /// must flush and compact without errors. Pre-multi-level the L0→L1
+    /// compaction output's index would overflow the single 1 MB index
+    /// budget at this cardinality and compaction silently failed. The
+    /// existing stress tests miss this because they hammer 30–50 keys
+    /// repeatedly — after dedup, merged outputs are tiny.
     #[test]
     fn compaction_handles_high_cardinality_distinct_keys() {
         const SMALL_MEMTABLE: usize = 32 * 1024;
-        const NUM_KEYS: u64 = 4_000;
+        const NUM_KEYS: u64 = 50_000;
         const VALUE_SIZE: usize = 256;
 
         let dir = tmp_dir();
@@ -759,8 +864,10 @@ mod tests {
         }
 
         // Give the flusher + compactor time to drain. Compactions cascade,
-        // so this must be long enough for at least one L0→L1 pass.
-        std::thread::sleep(Duration::from_secs(5));
+        // so this must be long enough for at least one L0→L1 pass. 50 k
+        // keys × 256 B against a 32 KB memtable means several hundred
+        // flushes plus the cascading L0→L1, so we allow generous slack.
+        std::thread::sleep(Duration::from_secs(15));
 
         let version = engine.current_version();
         let l0 = version.files_at_level(0).len();

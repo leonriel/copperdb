@@ -46,23 +46,33 @@ estimated 10,000 keys per SSTable. Under these parameters the bitmap is
 11,982 bytes plus a 44-byte crate header, totalling approximately 12 KB per
 SSTable.
 
-### Index Block
+### Index Region (two-level)
 
-The index block has the same binary format as a data block (see below), but
-its entries map a block's first `user_key` to that block's byte offset in the
-file. Each index entry is:
+The index occupies two block tiers, both using the same binary format as a
+data block:
 
-- **Key**: the first `user_key` of the data block (with `seq_num = 0`).
-- **Value**: the data block's starting byte offset as a big-endian `u64` (8 bytes),
-  stored as a `Record::Put`.
+1. **L1 (leaf) index blocks** — each maps the first `user_key` of a data
+   block to that data block's byte offset (big-endian `u64`, stored as a
+   `Record::Put`). One L1 block covers a contiguous run of data blocks.
+   Target size `L1_INDEX_TARGET_BLOCK_SIZE = 64 KB` ≈ 1,300 data-block
+   pointers ≈ 5 MB of data per L1 block.
+2. **Top index block** — one entry per L1 block, mapping the first key of
+   each L1 region to that L1 block's byte offset. Target size
+   `TOP_INDEX_TARGET_BLOCK_SIZE = 1 MB`. A 64 MB SSTable produces ~16 L1
+   pointers (well under 1 KB); a 100 GB SSTable would produce ~1.2 MB.
 
-The index block uses a larger byte budget than data blocks
-(`INDEX_TARGET_BLOCK_SIZE = 1 MB` vs `TARGET_BLOCK_SIZE = 4 KB`) because it
-must hold one entry per data block in the entire SSTable. At ~50 bytes per
-index entry, 1 MB holds ~20,000 entries — addressing roughly 80 MB of data,
-which covers the compaction-output cap with headroom. The block format itself
-is unchanged; only the target size differs. If the index ever exceeds 1 MB,
-the writer returns an error and multi-level indexing becomes necessary.
+On-disk order is `L1 Block 0 | L1 Block 1 | … | L1 Block M | Top Index`,
+and the footer's index-offset field points at the **top index block**. The
+reader loads the top index eagerly on `open` and reads individual L1 blocks
+on demand during `search`.
+
+Both index entries store offsets as `Record::Put(u64_be)`. The block format
+itself is unchanged from data blocks — we lean entirely on
+`BlockBuilder::with_target_size` to tune each tier independently.
+
+If the top index itself overflows `TOP_INDEX_TARGET_BLOCK_SIZE` (only
+possible for SSTables larger than ~80 GB at current sizing), the writer
+returns an error and a third index level would be required.
 
 ### Footer (24 bytes)
 

@@ -26,15 +26,21 @@ pub enum ReaderError {
 
 /// Provides point-lookup access to an on-disk SSTable file.
 ///
-/// On `open`, the footer is validated (magic number check) and the index
-/// block is loaded into memory. Subsequent `search` calls use the index to
-/// locate candidate data blocks, reading at most two blocks from disk to
-/// find the newest version of a key.
+/// On `open`, the footer is validated (magic number check) and the top
+/// index block is loaded into memory. Subsequent `search` calls navigate a
+/// two-level index: top → L1 (loaded on demand from disk) → data block.
+/// The MVCC-aware "predecessor + first-equal" candidate selection happens
+/// at both index levels so a key whose newest version sits at the tail of
+/// a preceding block is still found.
 pub struct SsTableReader {
     file: File,
-    index_block: Block,
-    /// Byte offset where the meta block begins (i.e. where data blocks end)
+    top_index: Block,
+    /// Byte offset where the meta block begins (i.e. where data blocks end).
+    /// Used as the implicit end of the last data block in an L1 region.
     meta_offset: u64,
+    /// Byte offset of the top index block. Used as the implicit end of the
+    /// last L1 block.
+    top_index_offset: u64,
     bloom: Bloom<String>,
 }
 
@@ -68,7 +74,7 @@ impl SsTableReader {
             u64::from_be_bytes(footer_buf[0..meta_end].try_into().map_err(|_| {
                 ReaderError::CorruptData("Failed to parse meta offset from footer".to_string())
             })?);
-        let index_offset =
+        let top_index_offset =
             u64::from_be_bytes(footer_buf[meta_end..index_end].try_into().map_err(|_| {
                 ReaderError::CorruptData("Failed to parse index offset from footer".to_string())
             })?);
@@ -81,129 +87,175 @@ impl SsTableReader {
             return Err(ReaderError::InvalidMagicNumber(magic));
         }
 
-        // 2. Read and deserialize the Meta Block (bloom filter)
-        let meta_size = index_offset - meta_offset;
+        // 2. Read and decode the Top Index Block. L1 blocks are read lazily
+        //    in `search`, not eagerly here. We do this *before* the bloom
+        //    so we can derive the meta block's exact size from the first
+        //    L1 block offset (the bloom payload has no length prefix; its
+        //    end is "wherever the first L1 block begins").
+        let top_index_size = file_len - (FOOTER_SIZE as u64) - top_index_offset;
+        file.seek(SeekFrom::Start(top_index_offset))?;
+        let mut top_index_data = vec![0u8; top_index_size as usize];
+        file.read_exact(&mut top_index_data)?;
+        let top_index = Block::decode(top_index_data);
+
+        // 3. Read and deserialize the Meta Block (bloom filter). It lives in
+        //    [meta_offset, first_L1_offset). For SSTables with no data
+        //    blocks (and therefore no L1 blocks) the top index is empty and
+        //    the bloom runs up to top_index_offset.
+        let first_l1_offset = first_offset_in(&top_index)?.unwrap_or(top_index_offset);
+        let meta_size = first_l1_offset - meta_offset;
         file.seek(SeekFrom::Start(meta_offset))?;
         let mut meta_data = vec![0u8; meta_size as usize];
         file.read_exact(&mut meta_data)?;
-
         let bloom = Bloom::from_bytes(meta_data)
             .map_err(|e| ReaderError::CorruptData(format!("Invalid bloom filter: {}", e)))?;
 
-        // 3. Read and decode the Index Block
-        let index_size = file_len - (FOOTER_SIZE as u64) - index_offset;
-        file.seek(SeekFrom::Start(index_offset))?;
-        let mut index_data = vec![0u8; index_size as usize];
-        file.read_exact(&mut index_data)?;
-
-        let index_block = Block::decode(index_data);
-
         Ok(Self {
             file,
-            index_block,
+            top_index,
             meta_offset,
+            top_index_offset,
             bloom,
         })
     }
 
     /// Searches for a specific user key in the SSTable.
-    /// Returns Ok(None) if the key does not exist in this file.
+    /// Returns `Ok(None)` if the key does not exist in this file.
+    ///
+    /// Walks the two-level index: top → up-to-2 candidate L1 blocks
+    /// (read from disk) → up-to-2 candidate data blocks per L1 (also from
+    /// disk). The predecessor + first-equal candidate-selection preserves
+    /// MVCC: a key whose newest version sits at the tail of a preceding
+    /// block is still found.
     pub fn search(
         &mut self,
         target_key: &str,
     ) -> Result<Option<(InternalKey, Record)>, ReaderError> {
-        // Fast path: if the bloom filter says the key is absent, skip disk reads
         if !self.bloom.check(&target_key.to_string()) {
             return Ok(None);
         }
 
-        let num_offsets = self.index_block.get_num_offsets()?;
-
-        if num_offsets == 0 {
+        // Top-level: find at-most-2 candidate L1 block ranges.
+        let l1_candidates =
+            find_candidates(&self.top_index, target_key, self.top_index_offset)?;
+        if l1_candidates.is_empty() {
             return Ok(None);
         }
 
-        let mut last_less_than = None;
-        let mut first_equal = None;
+        for (l1_start, l1_end) in l1_candidates {
+            // Load the L1 block from disk.
+            let l1_size = (l1_end - l1_start) as usize;
+            self.file.seek(SeekFrom::Start(l1_start))?;
+            let mut l1_data = vec![0u8; l1_size];
+            self.file.read_exact(&mut l1_data)?;
+            let l1_block = Block::decode(l1_data);
 
-        // 1. Scan the index to find the candidate blocks
-        for i in 0..num_offsets {
-            let entry_offset = self.index_block.get_offset(i, num_offsets)?;
-            let (key, record) = self.index_block.decode_entry(entry_offset)?;
+            // Within this L1 block, find at-most-2 candidate data block
+            // ranges. The data region ends at meta_offset.
+            let data_candidates = find_candidates(&l1_block, target_key, self.meta_offset)?;
 
-            let block_start = match record {
-                Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
-                    ReaderError::CorruptData("Index block pointer is not 8 bytes".to_string())
-                })?),
-                Record::Delete => {
-                    return Err(ReaderError::CorruptData(
-                        "Index block contains Delete record".to_string(),
-                    ));
+            for (data_start, data_end) in data_candidates {
+                let data_size = (data_end - data_start) as usize;
+                self.file.seek(SeekFrom::Start(data_start))?;
+                let mut data_block_bytes = vec![0u8; data_size];
+                self.file.read_exact(&mut data_block_bytes)?;
+                let data_block = Block::decode(data_block_bytes);
+
+                // Block::search returns the newest version (highest seq)
+                // present for `target_key` in that block.
+                if let Some(result) = data_block.search(target_key)? {
+                    return Ok(Some(result));
                 }
-            };
-
-            let next_block_offset = if i + 1 < num_offsets {
-                let next_entry_offset = self.index_block.get_offset(i + 1, num_offsets)?;
-                let (_, next_record) = self.index_block.decode_entry(next_entry_offset)?;
-
-                match next_record {
-                    Record::Put(val) => u64::from_be_bytes(val.try_into().map_err(|_| {
-                        ReaderError::CorruptData("Next index pointer is not 8 bytes".to_string())
-                    })?),
-                    Record::Delete => {
-                        return Err(ReaderError::CorruptData(
-                            "Next index contains Delete".to_string(),
-                        ));
-                    }
-                }
-            } else {
-                self.meta_offset
-            };
-
-            // Route to the correct candidate blocks
-            if key.user_key.as_str() < target_key {
-                last_less_than = Some((block_start, next_block_offset));
-            } else if key.user_key.as_str() == target_key {
-                if first_equal.is_none() {
-                    first_equal = Some((block_start, next_block_offset));
-                }
-                // Once we find the first block starting with the target, we don't need to look
-                // further. Subsequent blocks will only contain older versions.
-                break;
-            } else {
-                // key.user_key > target_key
-                break;
-            }
-        }
-
-        // Gather our candidates (at most 2 blocks)
-        let mut candidate_blocks = Vec::new();
-        if let Some(block) = last_less_than {
-            candidate_blocks.push(block);
-        }
-        if let Some(block) = first_equal {
-            candidate_blocks.push(block);
-        }
-
-        // 2. Read the candidate blocks from disk and search them in order
-        for (start_offset, next_offset) in candidate_blocks {
-            let block_size = next_offset - start_offset;
-
-            self.file.seek(SeekFrom::Start(start_offset))?;
-            let mut block_data = vec![0u8; block_size as usize];
-            self.file.read_exact(&mut block_data)?;
-
-            let data_block = Block::decode(block_data);
-
-            // If we find the key in the first candidate (which contains the highest seq numbers),
-            // we return it immediately and skip reading the second block.
-            if let Some(result) = data_block.search(target_key)? {
-                return Ok(Some(result));
             }
         }
 
         Ok(None)
     }
+}
+
+/// Decode the `u64` offset stored as a `Record::Put` payload in an index entry.
+fn decode_offset(record: Record) -> Result<u64, ReaderError> {
+    match record {
+        Record::Put(val) => {
+            let arr: [u8; 8] = val.try_into().map_err(|_| {
+                ReaderError::CorruptData("Index pointer is not 8 bytes".to_string())
+            })?;
+            Ok(u64::from_be_bytes(arr))
+        }
+        Record::Delete => Err(ReaderError::CorruptData(
+            "Index block contains Delete record".to_string(),
+        )),
+    }
+}
+
+/// Read the offset stored in the first entry of `index`, or `None` if empty.
+fn first_offset_in(index: &Block) -> Result<Option<u64>, ReaderError> {
+    let n = index.get_num_offsets()?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let entry_offset = index.get_offset(0, n)?;
+    let (_, record) = index.decode_entry(entry_offset)?;
+    decode_offset(record).map(Some)
+}
+
+/// MVCC-aware candidate selection over an index block.
+///
+/// Returns at most two `(start, end)` byte ranges in order: the predecessor
+/// (last entry whose first key < target) and the first entry whose first
+/// key == target. `region_end` is the byte offset where the indexed region
+/// ends (used to compute the end of the last entry). The same routine is
+/// used at the top index level (region_end = top_index_offset) and at the
+/// L1 level (region_end = meta_offset).
+///
+/// The predecessor is included because the newest version of `target` could
+/// be at the tail of the block that opens with a key < target.
+fn find_candidates(
+    index: &Block,
+    target_key: &str,
+    region_end: u64,
+) -> Result<Vec<(u64, u64)>, ReaderError> {
+    let n = index.get_num_offsets()?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut last_less_than: Option<(u64, u64)> = None;
+    let mut first_equal: Option<(u64, u64)> = None;
+
+    for i in 0..n {
+        let entry_offset = index.get_offset(i, n)?;
+        let (key, record) = index.decode_entry(entry_offset)?;
+        let block_start = decode_offset(record)?;
+
+        let block_end = if i + 1 < n {
+            let next_entry_offset = index.get_offset(i + 1, n)?;
+            let (_, next_record) = index.decode_entry(next_entry_offset)?;
+            decode_offset(next_record)?
+        } else {
+            region_end
+        };
+
+        if key.user_key.as_str() < target_key {
+            last_less_than = Some((block_start, block_end));
+        } else if key.user_key.as_str() == target_key {
+            if first_equal.is_none() {
+                first_equal = Some((block_start, block_end));
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(c) = last_less_than {
+        candidates.push(c);
+    }
+    if let Some(c) = first_equal {
+        candidates.push(c);
+    }
+    Ok(candidates)
 }
 
 #[cfg(test)]
