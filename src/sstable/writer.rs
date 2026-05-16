@@ -28,13 +28,18 @@ const BLOOM_FP_RATE: f64 = 0.01;
 /// raises the false-positive rate.
 const BLOOM_ESTIMATED_ITEMS: u32 = 10_000;
 
-/// Target byte budget for the index block. The index needs one entry per
-/// data block in the whole SSTable; at 4 KB data blocks and ~50-byte index
-/// entries, 1 MB holds ~20k entries → addresses ~80 MB of data, which
-/// comfortably covers the compaction-output cap. Pay the resident-memory
-/// cost (one of these per open SSTable) in exchange for keeping a
-/// single-level index.
-const INDEX_TARGET_BLOCK_SIZE: usize = 1024 * 1024;
+/// Target byte budget for an L1 (leaf) index block. Each L1 block maps a
+/// contiguous run of data blocks to their byte offsets. At ~51 bytes per
+/// entry, 64 KB holds ~1,300 data-block pointers (≈ 5 MB of data per L1
+/// block), which keeps a single L1 read cheap on the read path while still
+/// allowing the top index to stay tiny.
+const L1_INDEX_TARGET_BLOCK_SIZE: usize = 64 * 1024;
+
+/// Target byte budget for the top index block. The top index has one entry
+/// per L1 block; for typical 64 MB SSTables this is ~16 entries, well under
+/// 1 KB. Sized at 1 MB so multi-GB SSTables can still address all their L1
+/// blocks from a single top block (~80 GB at this size).
+const TOP_INDEX_TARGET_BLOCK_SIZE: usize = 1024 * 1024;
 
 /// Writes a sorted stream of key-record pairs to an on-disk SSTable file.
 ///
@@ -146,30 +151,9 @@ impl SsTableBuilder {
         self.file.write_all(&meta_data)?;
         self.current_offset += meta_data.len() as u64;
 
-        // Build the Index Block — uses a larger target than data blocks
-        // since one index entry is required per data block in the whole file.
-        let mut index_block = BlockBuilder::with_target_size(INDEX_TARGET_BLOCK_SIZE);
-        for (first_key, offset) in &self.block_index {
-            let index_key = InternalKey {
-                user_key: first_key.clone(),
-                seq_num: 0, // Dummy seq_num for index entries
-            };
-            let index_record = Record::Put(offset.to_be_bytes().to_vec());
-
-            let added = index_block.add(&index_key, &index_record);
-            if !added {
-                return Err(WriterError::InvalidData(
-                    "Index block exceeded INDEX_TARGET_BLOCK_SIZE. Multi-level index implementation required.".to_string()
-                ));
-            }
-        }
-
-        // Write the Index Block
-        let index_data = index_block.build();
-        let index_offset = self.current_offset;
-
-        self.file.write_all(&index_data)?;
-        self.current_offset += index_data.len() as u64;
+        // Write the two-level index (L1 blocks then top index).
+        // `top_index_offset` is what gets recorded in the footer.
+        let top_index_offset = self.write_two_level_index()?;
 
         // Write a fixed-size Footer (24 bytes)
         let mut footer = [0u8; FOOTER_SIZE];
@@ -178,7 +162,7 @@ impl SsTableBuilder {
         let magic_end = index_end + MAGIC_SIZE;
 
         footer[0..meta_end].copy_from_slice(&meta_offset.to_be_bytes());
-        footer[meta_end..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[meta_end..index_end].copy_from_slice(&top_index_offset.to_be_bytes());
         footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
 
         self.file.write_all(&footer)?;
@@ -248,34 +232,16 @@ impl SsTableBuilder {
         self.file.write_all(&meta_data)?;
         self.current_offset += meta_data.len() as u64;
 
-        // Build and write the Index Block (see build_from_iterator for the
-        // size rationale).
-        let mut index_block = BlockBuilder::with_target_size(INDEX_TARGET_BLOCK_SIZE);
-        for (first_key, offset) in &self.block_index {
-            let index_key = InternalKey {
-                user_key: first_key.clone(),
-                seq_num: 0,
-            };
-            let index_record = Record::Put(offset.to_be_bytes().to_vec());
-            if !index_block.add(&index_key, &index_record) {
-                return Err(WriterError::InvalidData(
-                    "Index block exceeded INDEX_TARGET_BLOCK_SIZE; multi-level index required"
-                        .to_string(),
-                ));
-            }
-        }
+        // Write the two-level index (L1 blocks then top index).
+        let top_index_offset = self.write_two_level_index()?;
 
-        let index_data = index_block.build();
-        let index_offset = self.current_offset;
-        self.file.write_all(&index_data)?;
-
-        // Write the Footer: [meta_offset | index_offset | magic]
+        // Write the Footer: [meta_offset | top_index_offset | magic]
         let mut footer = [0u8; FOOTER_SIZE];
         let meta_end = META_OFFSET_SIZE;
         let index_end = meta_end + INDEX_OFFSET_SIZE;
         let magic_end = index_end + MAGIC_SIZE;
         footer[0..meta_end].copy_from_slice(&meta_offset.to_be_bytes());
-        footer[meta_end..index_end].copy_from_slice(&index_offset.to_be_bytes());
+        footer[meta_end..index_end].copy_from_slice(&top_index_offset.to_be_bytes());
         footer[index_end..magic_end].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
         self.file.write_all(&footer)?;
         self.file.sync_all()?;
@@ -284,6 +250,101 @@ impl SsTableBuilder {
             (Some(lo), Some(hi)) => Some((lo, hi, self.max_seq_num)),
             _ => None,
         })
+    }
+
+    /// Build and write the two-level index for this SSTable.
+    ///
+    /// Walks `self.block_index` (the in-memory list of `(first_key,
+    /// data_block_offset)` recorded by `finish_current_block`), packs the
+    /// entries into L1 index blocks of `L1_INDEX_TARGET_BLOCK_SIZE`, writes
+    /// each L1 block to disk, then builds and writes the top index whose
+    /// entries point at the L1 blocks. Returns the byte offset of the top
+    /// index block, which the caller writes into the footer.
+    ///
+    /// The two-level structure removes the single-block index ceiling that
+    /// would otherwise cap SSTables at ~1 MB of index entries.
+    fn write_two_level_index(&mut self) -> Result<u64, WriterError> {
+        let mut l1_index: Vec<(String, u64)> = Vec::new();
+        let mut current_l1 = BlockBuilder::with_target_size(L1_INDEX_TARGET_BLOCK_SIZE);
+        let mut current_l1_first_key: Option<String> = None;
+
+        for (first_key, data_block_offset) in &self.block_index {
+            let entry_key = InternalKey {
+                user_key: first_key.clone(),
+                seq_num: 0, // Dummy seq for index entries.
+            };
+            let entry_val = Record::Put(data_block_offset.to_be_bytes().to_vec());
+
+            if !current_l1.add(&entry_key, &entry_val) {
+                // Current L1 is full. Flush it, then start a fresh L1 that
+                // opens with the rejected entry.
+                let full_l1 = std::mem::replace(
+                    &mut current_l1,
+                    BlockBuilder::with_target_size(L1_INDEX_TARGET_BLOCK_SIZE),
+                );
+                let l1_data = full_l1.build();
+                let l1_offset = self.current_offset;
+                self.file.write_all(&l1_data)?;
+                self.current_offset += l1_data.len() as u64;
+                l1_index.push((
+                    current_l1_first_key
+                        .take()
+                        .expect("L1 builder accepted entries; first key must be set"),
+                    l1_offset,
+                ));
+
+                // The just-rejected entry becomes the first of the new L1
+                // block. A single index entry should always fit in a fresh
+                // L1 block; if not, the L1 target is misconfigured.
+                if !current_l1.add(&entry_key, &entry_val) {
+                    return Err(WriterError::InvalidData(
+                        "A single index entry exceeds L1_INDEX_TARGET_BLOCK_SIZE"
+                            .to_string(),
+                    ));
+                }
+                current_l1_first_key = Some(first_key.clone());
+            } else if current_l1_first_key.is_none() {
+                current_l1_first_key = Some(first_key.clone());
+            }
+        }
+
+        // Flush the trailing partial L1 block (if any entries are buffered).
+        if !current_l1.is_empty() {
+            let l1_data = current_l1.build();
+            let l1_offset = self.current_offset;
+            self.file.write_all(&l1_data)?;
+            self.current_offset += l1_data.len() as u64;
+            l1_index.push((
+                current_l1_first_key
+                    .take()
+                    .expect("non-empty L1 block has a first key"),
+                l1_offset,
+            ));
+        }
+
+        // Build and write the top index. Each entry maps the first key of
+        // an L1 block to that block's offset.
+        let mut top = BlockBuilder::with_target_size(TOP_INDEX_TARGET_BLOCK_SIZE);
+        for (first_key, l1_offset) in &l1_index {
+            let key = InternalKey {
+                user_key: first_key.clone(),
+                seq_num: 0,
+            };
+            let val = Record::Put(l1_offset.to_be_bytes().to_vec());
+            if !top.add(&key, &val) {
+                return Err(WriterError::InvalidData(
+                    "Top index exceeded TOP_INDEX_TARGET_BLOCK_SIZE; \
+                     a third level is needed for SSTables this large"
+                        .to_string(),
+                ));
+            }
+        }
+        let top_data = top.build();
+        let top_offset = self.current_offset;
+        self.file.write_all(&top_data)?;
+        self.current_offset += top_data.len() as u64;
+
+        Ok(top_offset)
     }
 
     /// Helper to write the current block to disk and record its location in the index.
@@ -469,6 +530,14 @@ mod tests {
         );
     }
 
+    /// Decode an index entry's `Record::Put` value as a u64 offset.
+    fn decode_offset_record(record: Record) -> u64 {
+        match record {
+            Record::Put(val) => u64::from_be_bytes(val.try_into().unwrap()),
+            Record::Delete => panic!("Index block should not contain deletes"),
+        }
+    }
+
     #[test]
     fn test_builder_single_block() {
         let file = TempFileGuard::new("single_block_test.sst");
@@ -484,48 +553,49 @@ mod tests {
         let iter = Box::new(MockIterator::new(entries));
         builder.build_from_iterator(iter).unwrap();
 
-        // --- Verification ---
+        // --- Verification: navigate the two-level index ---
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
 
-        let (meta_offset, index_offset) = parse_footer(&data);
+        let (meta_offset, top_index_offset) = parse_footer(&data);
 
-        // 1. Verify Index Block
-        let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
-        let index_block = Block::decode(index_data);
-
+        // 1. Top index: exactly 1 L1 block.
+        let top_data = data[top_index_offset..len - FOOTER_SIZE].to_vec();
+        let top_index = Block::decode(top_data);
         assert_eq!(
-            index_block.get_num_offsets().unwrap(),
+            top_index.get_num_offsets().unwrap(),
             1,
-            "There should be exactly 1 data block indexed"
+            "Top index should contain exactly 1 L1 pointer"
         );
-        let offset_index_0 = index_block.get_offset(0, 1).unwrap();
-        let (first_key_entry, pointer_record) = index_block.decode_entry(offset_index_0).unwrap();
+        let (top_key, top_record) = top_index
+            .decode_entry(top_index.get_offset(0, 1).unwrap())
+            .unwrap();
+        assert_eq!(top_key.user_key, "apple", "Top index opens with apple");
+        let l1_start = decode_offset_record(top_record) as usize;
 
+        // 2. L1 block (between meta block and top index, opens at l1_start).
+        let l1_end = top_index_offset;
+        let l1_data = data[l1_start..l1_end].to_vec();
+        let l1_block = Block::decode(l1_data);
         assert_eq!(
-            first_key_entry.user_key, "apple",
-            "Index should track the first key of the block"
+            l1_block.get_num_offsets().unwrap(),
+            1,
+            "L1 should contain exactly 1 data-block pointer"
         );
-
-        // Extract the physical offset to the data block
-        let data_block_offset = match pointer_record {
-            Record::Put(val) => u64::from_be_bytes(val.try_into().unwrap()) as usize,
-            Record::Delete => panic!("Index block should not contain deletes"),
-        };
+        let (l1_key, l1_record) = l1_block
+            .decode_entry(l1_block.get_offset(0, 1).unwrap())
+            .unwrap();
+        assert_eq!(l1_key.user_key, "apple", "L1 entry opens with apple");
         assert_eq!(
-            data_block_offset, 0,
-            "The first data block should start at byte 0"
+            decode_offset_record(l1_record),
+            0,
+            "First data block should start at byte 0"
         );
 
-        // 2. Verify Data Block (data blocks end where the meta block begins)
+        // 3. Data block (data blocks end where the meta block begins).
         let data_block_bytes = data[0..meta_offset].to_vec();
         let data_block = Block::decode(data_block_bytes);
-
-        assert_eq!(
-            data_block.get_num_offsets().unwrap(),
-            3,
-            "Data block should contain 3 entries"
-        );
+        assert_eq!(data_block.get_num_offsets().unwrap(), 3);
 
         let (cherry_k, cherry_r) = data_block.search("cherry").unwrap().unwrap();
         assert_eq!(cherry_k.seq_num, 1);
@@ -549,57 +619,72 @@ mod tests {
         let iter = Box::new(MockIterator::new(entries));
         builder.build_from_iterator(iter).unwrap();
 
-        // --- Verification ---
+        // --- Verification: walk top → L1 → data ---
         let data = fs::read(&file.path).unwrap();
         let len = data.len();
 
-        let (_meta_offset, index_offset) = parse_footer(&data);
+        let (meta_offset, top_index_offset) = parse_footer(&data);
 
-        // 1. Verify Index Block has multiple pointers
-        let index_data = data[index_offset..len - FOOTER_SIZE].to_vec();
-        let index_block = Block::decode(index_data);
+        // Top index → collect (l1_start, l1_end) ranges.
+        let top_data = data[top_index_offset..len - FOOTER_SIZE].to_vec();
+        let top_index = Block::decode(top_data);
+        let n_l1 = top_index.get_num_offsets().unwrap();
+        assert!(n_l1 >= 1);
+        let mut l1_ranges: Vec<(usize, usize)> = Vec::with_capacity(n_l1);
+        for i in 0..n_l1 {
+            let entry_off = top_index.get_offset(i, n_l1).unwrap();
+            let (_, rec) = top_index.decode_entry(entry_off).unwrap();
+            let start = decode_offset_record(rec) as usize;
+            let end = if i + 1 < n_l1 {
+                let next_off = top_index.get_offset(i + 1, n_l1).unwrap();
+                let (_, next_rec) = top_index.decode_entry(next_off).unwrap();
+                decode_offset_record(next_rec) as usize
+            } else {
+                top_index_offset
+            };
+            l1_ranges.push((start, end));
+        }
 
-        let num_data_blocks = index_block.get_num_offsets().unwrap();
+        // Across all L1 blocks → collect the flat list of data-block ranges.
+        let mut data_block_starts: Vec<usize> = Vec::new();
+        let mut data_block_first_keys: Vec<String> = Vec::new();
+        for (l1_start, l1_end) in &l1_ranges {
+            let l1_data = data[*l1_start..*l1_end].to_vec();
+            let l1_block = Block::decode(l1_data);
+            let n = l1_block.get_num_offsets().unwrap();
+            for j in 0..n {
+                let entry_off = l1_block.get_offset(j, n).unwrap();
+                let (idx_key, idx_rec) = l1_block.decode_entry(entry_off).unwrap();
+                data_block_starts.push(decode_offset_record(idx_rec) as usize);
+                data_block_first_keys.push(idx_key.user_key);
+            }
+        }
+
         assert!(
-            num_data_blocks > 1,
+            data_block_starts.len() > 1,
             "Builder should have created multiple data blocks"
         );
 
-        // 2. Walk through the index and verify EVERY Data Block
-        for i in 0..num_data_blocks {
-            let idx_entry_offset = index_block.get_offset(i, num_data_blocks).unwrap();
-            let (idx_key, pointer_record) = index_block.decode_entry(idx_entry_offset).unwrap();
-
-            let block_start = match pointer_record {
-                Record::Put(val) => u64::from_be_bytes(val.try_into().unwrap()) as usize,
-                Record::Delete => panic!("Index contains a Delete"),
-            };
-
-            // The block ends where the next block begins, or where the index block begins
-            let block_end = if i + 1 < num_data_blocks {
-                let next_idx_entry_offset = index_block.get_offset(i + 1, num_data_blocks).unwrap();
-                let (_, next_pointer_record) =
-                    index_block.decode_entry(next_idx_entry_offset).unwrap();
-                match next_pointer_record {
-                    Record::Put(val) => u64::from_be_bytes(val.try_into().unwrap()) as usize,
-                    _ => unreachable!(),
-                }
+        // Walk every data block, confirm its first key matches what the
+        // index claims.
+        for i in 0..data_block_starts.len() {
+            let block_start = data_block_starts[i];
+            let block_end = if i + 1 < data_block_starts.len() {
+                data_block_starts[i + 1]
             } else {
-                index_offset
+                meta_offset
             };
 
             let data_block_bytes = data[block_start..block_end].to_vec();
             let data_block = Block::decode(data_block_bytes);
-
-            // Ensure the data block is valid and its first key matches what the index block claims!
             let first_key_offset = data_block
                 .get_offset(0, data_block.get_num_offsets().unwrap())
                 .unwrap();
             let (actual_first_key, _) = data_block.decode_entry(first_key_offset).unwrap();
 
             assert_eq!(
-                idx_key.user_key, actual_first_key.user_key,
-                "Index block key does not match actual first key of data block {}",
+                data_block_first_keys[i], actual_first_key.user_key,
+                "Index key does not match actual first key of data block {}",
                 i
             );
         }
@@ -700,5 +785,61 @@ mod tests {
             "File size ({} bytes) is unusually large, possible runaway allocation",
             file_size
         );
+    }
+
+    /// An SSTable with enough distinct keys to force the L1 index to spill
+    /// across multiple blocks must still round-trip cleanly through
+    /// `SsTableReader::search`. Pre-multi-level this would fail with
+    /// "Index block exceeded INDEX_TARGET_BLOCK_SIZE".
+    #[test]
+    fn sstable_round_trip_multi_l1_index() {
+        use crate::sstable::reader::SsTableReader;
+
+        const NUM_KEYS: u64 = 30_000;
+        const VALUE_SIZE: usize = 256;
+
+        let file = TempFileGuard::new("multi_l1_round_trip.sst");
+        let mut builder = SsTableBuilder::new(file.path_str()).unwrap();
+
+        let entries: Vec<(String, Record, u64)> = (0..NUM_KEYS)
+            .map(|i| {
+                let key = format!("key_{:020}", i);
+                let val = vec![(i % 256) as u8; VALUE_SIZE];
+                (key, Record::Put(val), NUM_KEYS - i)
+            })
+            .collect();
+
+        builder
+            .build_from_iterator(Box::new(MockIterator::new(entries)))
+            .unwrap();
+
+        // Verify structurally: walk the top index and confirm there's more
+        // than one L1 block (which is what proves the multi-level path
+        // is being exercised).
+        let raw = fs::read(&file.path).unwrap();
+        let (_meta_offset, top_index_offset) = parse_footer(&raw);
+        let top_data = raw[top_index_offset..raw.len() - FOOTER_SIZE].to_vec();
+        let top_index = Block::decode(top_data);
+        let n_l1 = top_index.get_num_offsets().unwrap();
+        assert!(
+            n_l1 > 1,
+            "Expected multiple L1 index blocks for {} keys, got {}",
+            NUM_KEYS,
+            n_l1,
+        );
+
+        // Reads succeed across the whole key range (first, middle, last).
+        let mut reader = SsTableReader::open(file.path_str()).unwrap();
+        for sample_i in [0u64, NUM_KEYS / 2, NUM_KEYS - 1] {
+            let key = format!("key_{:020}", sample_i);
+            let got = reader.search(&key).unwrap();
+            let (k, r) = got.unwrap_or_else(|| panic!("missing {}", key));
+            assert_eq!(k.user_key, key);
+            assert_eq!(k.seq_num, NUM_KEYS - sample_i);
+            assert!(matches!(r, Record::Put(v) if v.len() == VALUE_SIZE));
+        }
+
+        // A key absent from the SSTable returns None (bloom + structural).
+        assert!(reader.search("key_99999999999999999999").unwrap().is_none());
     }
 }

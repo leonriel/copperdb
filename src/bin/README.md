@@ -91,10 +91,9 @@ cargo run --release --bin bench -- \
     --keys 5000 --value-size 256 --duration 10
 ```
 
-> **Note on current engine limits.** The TOML presets default to 1 M × 1 KB,
-> which exceeds the SSTable writer's single-level 1 MB index budget during
-> compaction. Smoke the presets with `--keys` / `--value-size` overrides until
-> the engine grows a multi-level index. See `src/sstable/DESIGN.md`.
+The TOML presets default to 1 M × 1 KB, which now works as-is thanks to
+the two-level SSTable index (see `src/sstable/DESIGN.md`). Smaller overrides
+remain useful for quick smoke tests during development.
 
 ## CLI reference
 
@@ -108,7 +107,7 @@ cargo run --release --bin bench -- \
 | `--target-rate <r>` | (open-loop)  | Total ops/sec across all threads. Enables closed-loop + CO correction. |
 | `--seed <u64>`      | `42`         | PRNG seed. Each thread uses `seed + thread_id`.                    |
 | `--cooldown <secs>` | `1`          | Sleep between load and run phases so background work drains.       |
-| `--memtable-size`   | `204800`     | Memtable byte budget. Defaults to 200 KB to fit the index limit.   |
+| `--memtable-size`   | `204800`     | Memtable byte budget. 200 KB default keeps flushes brisk for development; raise for larger runs. |
 
 ### Workload flags (CLI or TOML)
 
@@ -198,5 +197,3 @@ cargo run --release --bin bench -- --dir /tmp/sustain --config workloads/ycsb-c.
   the answer.
 - **No `scan` workload (YCSB-E).** `LsmEngine` has no public `scan` API;
   adding one is a separate engine feature, not part of the harness phasing.
-- **Index-block limit at full preset defaults.** Documented in
-  `workloads/README.md`.

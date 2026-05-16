@@ -28,13 +28,9 @@ TOML preset and edit it. Run-time knobs (`--dir`, `--duration`, `--seed`,
 `--cooldown`, `--memtable-size`) are always supplied via CLI; the TOML
 describes the *workload*, not the *run*.
 
-> **Note on current engine limits.** The SSTable writer uses a single-level
-> 1 MB index block (see `src/sstable/DESIGN.md`). At the full 1M × 1KB
-> defaults, the L0→L1 compaction output's index exceeds 1 MB and the
-> compaction fails. Until copperdb grows a multi-level index, smoke-test the
-> presets with smaller overrides — e.g.
-> `--keys 5000 --value-size 256` — or use smaller per-value sizes
-> (`--value-size 64`) at the full key count.
+The SSTable writer uses a two-level index (see `src/sstable/DESIGN.md`), so
+the TOML defaults run as written. Smaller overrides remain useful for fast
+smoke tests during development.
 
 Reference: B. F. Cooper et al., *Benchmarking Cloud Serving Systems with
 YCSB* (SoCC '10). Our numbers aren't directly comparable to the paper's
