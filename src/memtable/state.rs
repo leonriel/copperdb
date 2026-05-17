@@ -114,6 +114,24 @@ impl MemTableState {
         self.inner.read().unwrap().immutable.len()
     }
 
+    /// Atomic snapshot of every memtable currently visible to readers: the
+    /// active memtable followed by each immutable memtable in oldest-first
+    /// order. Used by `LsmEngine::scan` to build a consistent view across
+    /// memtable + SSTable storage.
+    ///
+    /// The Arc clones make this cheap and lock-free for the duration of the
+    /// scan — concurrent writes still proceed on the live memtable, but they
+    /// won't be reflected in this snapshot.
+    pub fn snapshot_memtables(&self) -> Vec<Arc<CrossbeamMemTable>> {
+        let guard = self.inner.read().unwrap();
+        let mut out = Vec::with_capacity(guard.immutable.len() + 1);
+        out.push(Arc::clone(&guard.active));
+        for table in guard.immutable.iter() {
+            out.push(Arc::clone(table));
+        }
+        out
+    }
+
     /// Blocks the calling thread until the immutable queue drops below the
     /// backpressure threshold. Returns `true` if the wait completed normally,
     /// `false` if the timeout expired while still stalled.

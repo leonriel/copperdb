@@ -7,7 +7,7 @@ use bloomfilter::Bloom;
 use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::BlockBuilder;
 use crate::sstable::{
-    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, MagicNumber, META_OFFSET_SIZE,
+    FOOTER_SIZE, INDEX_OFFSET_SIZE, IndexOffset, MAGIC_NUMBER, MAGIC_SIZE, META_OFFSET_SIZE,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -378,6 +378,7 @@ impl SsTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sstable::MagicNumber;
     use crate::sstable::{MetaOffset, IndexOffset};
     use crate::sstable::block::Block;
     use std::fs;

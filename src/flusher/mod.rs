@@ -97,7 +97,6 @@ fn flush_pending(engine: &EngineCore) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::engine::LsmEngine;
     use std::sync::atomic::Ordering;
     use std::time::Duration;

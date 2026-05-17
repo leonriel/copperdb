@@ -16,6 +16,8 @@ use crate::sstable::reader::SsTableReader;
 
 use std::time::Duration;
 
+mod scan;
+
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]
@@ -335,6 +337,23 @@ impl EngineCore {
         Ok(())
     }
 
+    /// Range scan: returns up to `limit` live `(user_key, value)` pairs whose
+    /// keys fall in the range described by `start` and `end` (both `Bound`),
+    /// in ascending key order. Tombstones suppress their key from the output;
+    /// only the newest version of each key is returned.
+    ///
+    /// Snapshot semantics: the scan observes a consistent point-in-time view
+    /// of the engine. Concurrent writes that arrive after the call begins are
+    /// not reflected.
+    pub fn scan(
+        &self,
+        start: std::ops::Bound<&str>,
+        end: std::ops::Bound<&str>,
+        limit: usize,
+    ) -> io::Result<Vec<(String, Vec<u8>)>> {
+        scan::scan_impl(self, start, end, limit)
+    }
+
     /// Read-only snapshot of engine counters and live state. Used by the
     /// benchmark harness for diagnostic time-series output; cheap enough to
     /// call once per second.
@@ -498,6 +517,32 @@ impl StorageEngine for LsmHandle {
             .await
             .expect("spawn_blocking panicked")
             .map_err(EngineError::from)
+    }
+
+    async fn scan(
+        &self,
+        start: std::ops::Bound<String>,
+        end: std::ops::Bound<String>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
+        let engine = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            engine.scan(bound_as_ref(&start), bound_as_ref(&end), limit)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+        .map_err(EngineError::from)
+    }
+}
+
+/// Convert `&Bound<String>` to `Bound<&str>` for the sync engine call. The
+/// async API takes owned `String`s because the future must be `'static`
+/// once spawned onto the blocking pool, but the sync API can borrow.
+fn bound_as_ref(b: &std::ops::Bound<String>) -> std::ops::Bound<&str> {
+    match b {
+        std::ops::Bound::Included(s) => std::ops::Bound::Included(s.as_str()),
+        std::ops::Bound::Excluded(s) => std::ops::Bound::Excluded(s.as_str()),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
     }
 }
 
@@ -1206,5 +1251,219 @@ mod tests {
         assert_eq!(stats.in_flight_compactions, 0);
         assert_eq!(stats.l0_file_count, 0);
         assert_eq!(stats.immutable_queue_depth, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Range-scan tests
+    //
+    // Each test covers one slice of `LsmEngine::scan`'s contract:
+    // empty / bounds / limit / tombstones / MVCC dedup / memtable+SSTable
+    // overlap / cross-level merging.
+    // -----------------------------------------------------------------------
+
+    use std::ops::Bound;
+
+    /// `scan` on a fresh engine returns nothing.
+    #[test]
+    fn scan_empty_engine_returns_empty() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 100)
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Inclusive/Excluded bounds + ascending order over keys present only in
+    /// the active memtable.
+    #[test]
+    fn scan_memtable_only_range_with_bounds() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        // Load 10 keys: k00..k09 mapping to values 0..9.
+        for i in 0u32..10 {
+            engine
+                .put(format!("k{:02}", i), vec![i as u8])
+                .unwrap();
+        }
+
+        // [k03, k07) — Included start, Excluded end. Expect k03..k06.
+        let out = engine
+            .scan(Bound::Included("k03"), Bound::Excluded("k07"), 100)
+            .unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["k03", "k04", "k05", "k06"]);
+
+        // Values come back intact.
+        assert_eq!(out[0].1, vec![3u8]);
+        assert_eq!(out[3].1, vec![6u8]);
+
+        // Excluded start: (k02, Unbounded] — expect k03..k09.
+        let out = engine
+            .scan(Bound::Excluded("k02"), Bound::Unbounded, 100)
+            .unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["k03", "k04", "k05", "k06", "k07", "k08", "k09"]);
+
+        // Inclusive end: [k05, k07].
+        let out = engine
+            .scan(Bound::Included("k05"), Bound::Included("k07"), 100)
+            .unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["k05", "k06", "k07"]);
+    }
+
+    /// `limit` caps the result count; matches return in ascending order
+    /// from the start of the range.
+    #[test]
+    fn scan_respects_limit() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+        for i in 0u32..20 {
+            engine
+                .put(format!("k{:02}", i), vec![i as u8])
+                .unwrap();
+        }
+
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 5)
+            .unwrap();
+        assert_eq!(out.len(), 5);
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["k00", "k01", "k02", "k03", "k04"]);
+
+        // `limit = 0` returns empty without touching storage.
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 0)
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// A deleted key is invisible to `scan`, even though its tombstone is
+    /// present in storage with a higher seq than the prior `Put`.
+    #[test]
+    fn scan_filters_tombstones() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        engine.put("apple".to_string(), b"red".to_vec()).unwrap();
+        engine.put("banana".to_string(), b"yellow".to_vec()).unwrap();
+        engine.put("cherry".to_string(), b"darkred".to_vec()).unwrap();
+        engine.delete("banana".to_string()).unwrap();
+
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 100)
+            .unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["apple", "cherry"]);
+    }
+
+    /// MVCC: an overwritten key yields only its newest value.
+    #[test]
+    fn scan_returns_newest_version() {
+        let dir = tmp_dir();
+        let engine = LsmEngine::open(&dir).unwrap();
+
+        engine.put("k".to_string(), b"v1".to_vec()).unwrap();
+        engine.put("k".to_string(), b"v2".to_vec()).unwrap();
+        engine.put("k".to_string(), b"v3".to_vec()).unwrap();
+
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 100)
+            .unwrap();
+        assert_eq!(out, vec![("k".to_string(), b"v3".to_vec())]);
+    }
+
+    /// After a flush the engine holds keys in both the memtable and an
+    /// SSTable; `scan` must merge them transparently. Uses a smallish
+    /// memtable to force a flush of the first half of the keys before the
+    /// second half is written.
+    #[test]
+    fn scan_across_memtable_and_sstable() {
+        const SMALL_MEMTABLE: usize = 32 * 1024;
+        let dir = tmp_dir();
+        let engine =
+            LsmEngine::open_with_memtable_size(&dir, SMALL_MEMTABLE).unwrap();
+
+        // First half: enough volume to fill the memtable and trigger a flush.
+        for i in 0u32..200 {
+            engine
+                .put(format!("k{:04}", i), vec![i as u8; 200])
+                .unwrap();
+        }
+        // Brief pause so the flusher can drain at least one immutable
+        // memtable. `scan_across_levels` exercises the more aggressive case.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Second half: lands in the active memtable.
+        for i in 200u32..400 {
+            engine
+                .put(format!("k{:04}", i), vec![i as u8; 200])
+                .unwrap();
+        }
+
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 1000)
+            .unwrap();
+        assert_eq!(out.len(), 400);
+
+        // Keys must be ascending and cover every i from 0..400.
+        for (idx, (key, val)) in out.iter().enumerate() {
+            assert_eq!(*key, format!("k{:04}", idx));
+            assert_eq!(val.len(), 200);
+            assert_eq!(val[0], idx as u8);
+        }
+    }
+
+    /// Drive enough writes through a small memtable to trigger L0→L1
+    /// compaction, then scan. The merge path crosses memtable, L0, and L1.
+    #[test]
+    fn scan_across_levels() {
+        const TINY_MEMTABLE: usize = 16 * 1024;
+        let dir = tmp_dir();
+        let engine =
+            LsmEngine::open_with_memtable_size(&dir, TINY_MEMTABLE).unwrap();
+
+        // 600 keys × 100 B values = ~60 KB — plenty of flushes, kicking
+        // off L0→L1 compaction (trigger at 4 L0 files).
+        for i in 0u32..600 {
+            engine
+                .put(format!("k{:04}", i), vec![i as u8; 100])
+                .unwrap();
+        }
+        // Drain compactions.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Add a few more keys to the live memtable so the scan exercises
+        // all three sources.
+        for i in 600u32..620 {
+            engine
+                .put(format!("k{:04}", i), vec![i as u8; 100])
+                .unwrap();
+        }
+
+        // Bounded range that straddles the level boundaries.
+        let out = engine
+            .scan(Bound::Included("k0100"), Bound::Excluded("k0500"), 10_000)
+            .unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        let expected: Vec<String> =
+            (100u32..500).map(|i| format!("k{:04}", i)).collect();
+        assert_eq!(
+            keys,
+            expected.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
+
+        // Full scan returns everything (620 keys).
+        let out = engine
+            .scan(Bound::Unbounded, Bound::Unbounded, 10_000)
+            .unwrap();
+        assert_eq!(out.len(), 620);
+        // Spot-check a value from each side of a likely level boundary.
+        let mid = &out[300];
+        assert_eq!(mid.0, "k0300");
+        // Value bytes are `i as u8`, so 300 wraps to 44.
+        assert_eq!(mid.1[0], 300u32 as u8);
     }
 }

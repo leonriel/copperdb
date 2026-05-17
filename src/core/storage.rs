@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::Bound;
 
 use async_trait::async_trait;
 
@@ -23,4 +24,15 @@ pub trait StorageEngine: Send + Sync {
     async fn put(&self, key: String, value: Vec<u8>) -> Result<(), EngineError>;
     async fn get(&self, key: String) -> Result<Option<Vec<u8>>, EngineError>;
     async fn delete(&self, key: String) -> Result<(), EngineError>;
+
+    /// Range scan over `[start, end)` (Bound flexibility on both ends),
+    /// returning up to `limit` live (key, value) pairs in ascending key order.
+    /// Tombstones suppress their key from the output; only the newest version
+    /// of each key is returned.
+    async fn scan(
+        &self,
+        start: Bound<String>,
+        end: Bound<String>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, EngineError>;
 }
