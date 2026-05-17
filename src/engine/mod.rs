@@ -337,20 +337,29 @@ impl EngineCore {
         Ok(())
     }
 
-    /// Range scan: returns up to `limit` live `(user_key, value)` pairs whose
-    /// keys fall in the range described by `start` and `end` (both `Bound`),
-    /// in ascending key order. Tombstones suppress their key from the output;
-    /// only the newest version of each key is returned.
+    /// Range scan: returns an iterator over up to `limit` live
+    /// `(user_key, value)` pairs whose keys fall in the range described by
+    /// `start` and `end` (both `Bound`), in ascending key order. Tombstones
+    /// suppress their key from the output; only the newest version of each
+    /// key is returned.
     ///
-    /// Snapshot semantics: the scan observes a consistent point-in-time view
-    /// of the engine. Concurrent writes that arrive after the call begins are
-    /// not reflected.
+    /// Snapshot semantics: the scan observes a consistent point-in-time
+    /// view of the engine. Concurrent writes that arrive after `scan` is
+    /// called are not reflected, even if the caller polls the iterator
+    /// later.
+    ///
+    /// The iterator is `'static` — it owns Arcs to the snapshotted
+    /// memtables and the SSTable version, plus open file handles for any
+    /// SSTables it might read. Callers can hold it across `await` points
+    /// or drop it mid-stream without leaking state. `LsmHandle::scan`
+    /// collects this iterator into a `Vec` for the `StorageEngine` trait;
+    /// in-process consumers can stream record-by-record instead.
     pub fn scan(
         &self,
         start: std::ops::Bound<&str>,
         end: std::ops::Bound<&str>,
         limit: usize,
-    ) -> io::Result<Vec<(String, Vec<u8>)>> {
+    ) -> io::Result<impl Iterator<Item = (String, Vec<u8>)>> {
         scan::scan_impl(self, start, end, limit)
     }
 
@@ -527,7 +536,11 @@ impl StorageEngine for LsmHandle {
     ) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
         let engine = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            engine.scan(bound_as_ref(&start), bound_as_ref(&end), limit)
+            // The sync API returns an iterator; the async trait contract
+            // is a Vec, so we collect inside the blocking task.
+            engine
+                .scan(bound_as_ref(&start), bound_as_ref(&end), limit)
+                .map(|it| it.collect::<Vec<_>>())
         })
         .await
         .expect("spawn_blocking panicked")
@@ -1268,9 +1281,10 @@ mod tests {
     fn scan_empty_engine_returns_empty() {
         let dir = tmp_dir();
         let engine = LsmEngine::open(&dir).unwrap();
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert!(out.is_empty());
     }
 
@@ -1289,9 +1303,10 @@ mod tests {
         }
 
         // [k03, k07) — Included start, Excluded end. Expect k03..k06.
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Included("k03"), Bound::Excluded("k07"), 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["k03", "k04", "k05", "k06"]);
 
@@ -1300,16 +1315,18 @@ mod tests {
         assert_eq!(out[3].1, vec![6u8]);
 
         // Excluded start: (k02, Unbounded] — expect k03..k09.
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Excluded("k02"), Bound::Unbounded, 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["k03", "k04", "k05", "k06", "k07", "k08", "k09"]);
 
         // Inclusive end: [k05, k07].
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Included("k05"), Bound::Included("k07"), 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["k05", "k06", "k07"]);
     }
@@ -1326,17 +1343,19 @@ mod tests {
                 .unwrap();
         }
 
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 5)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert_eq!(out.len(), 5);
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["k00", "k01", "k02", "k03", "k04"]);
 
         // `limit = 0` returns empty without touching storage.
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 0)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert!(out.is_empty());
     }
 
@@ -1352,9 +1371,10 @@ mod tests {
         engine.put("cherry".to_string(), b"darkred".to_vec()).unwrap();
         engine.delete("banana".to_string()).unwrap();
 
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["apple", "cherry"]);
     }
@@ -1369,9 +1389,10 @@ mod tests {
         engine.put("k".to_string(), b"v2".to_vec()).unwrap();
         engine.put("k".to_string(), b"v3".to_vec()).unwrap();
 
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 100)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert_eq!(out, vec![("k".to_string(), b"v3".to_vec())]);
     }
 
@@ -1403,9 +1424,10 @@ mod tests {
                 .unwrap();
         }
 
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 1000)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert_eq!(out.len(), 400);
 
         // Keys must be ascending and cover every i from 0..400.
@@ -1444,9 +1466,10 @@ mod tests {
         }
 
         // Bounded range that straddles the level boundaries.
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Included("k0100"), Bound::Excluded("k0500"), 10_000)
-            .unwrap();
+            .unwrap()
+            .collect();
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         let expected: Vec<String> =
             (100u32..500).map(|i| format!("k{:04}", i)).collect();
@@ -1456,9 +1479,10 @@ mod tests {
         );
 
         // Full scan returns everything (620 keys).
-        let out = engine
+        let out: Vec<_> = engine
             .scan(Bound::Unbounded, Bound::Unbounded, 10_000)
-            .unwrap();
+            .unwrap()
+            .collect();
         assert_eq!(out.len(), 620);
         // Spot-check a value from each side of a likely level boundary.
         let mid = &out[300];
