@@ -1,12 +1,15 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
 };
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 use crate::core::{EngineError, StorageEngine};
 
@@ -20,6 +23,7 @@ pub type SharedEngine = Arc<dyn StorageEngine>;
 pub fn build_router(engine: SharedEngine) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/kv", get(scan_kv))
         .route(
             "/kv/{key}",
             get(get_kv).put(put_kv).delete(delete_kv),
@@ -66,6 +70,71 @@ async fn delete_kv(
 fn log_and_500(op: &str, err: EngineError) -> StatusCode {
     eprintln!("[server] {} failed: {}", op, err);
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+// ---------------------------------------------------------------------------
+// Range scan: GET /kv?start=…&end=…&limit=…
+//
+// Half-open `[start, end)` per the LevelDB/RocksDB/YCSB convention. Both
+// bounds and `limit` are optional. Response is `{"results": [...]}` with
+// values base64-encoded — JSON has no native binary type and the engine
+// stores arbitrary bytes, so any serialisation that packs multiple values
+// into one response needs *some* encoding here. The single-key endpoints
+// don't have that problem (their body *is* the value), so they remain
+// raw-bytes.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ScanParams {
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default = "default_scan_limit")]
+    limit: usize,
+}
+
+fn default_scan_limit() -> usize {
+    1000
+}
+
+#[derive(Serialize)]
+struct ScanResponse {
+    results: Vec<ScanEntry>,
+}
+
+#[derive(Serialize)]
+struct ScanEntry {
+    key: String,
+    /// Base64-encoded bytes.
+    value: String,
+}
+
+async fn scan_kv(
+    State(engine): State<SharedEngine>,
+    Query(params): Query<ScanParams>,
+) -> Result<Json<ScanResponse>, StatusCode> {
+    let start = params
+        .start
+        .map_or(Bound::Unbounded, Bound::Included);
+    let end = params
+        .end
+        .map_or(Bound::Unbounded, Bound::Excluded);
+
+    let pairs = engine
+        .scan(start, end, params.limit)
+        .await
+        .map_err(|e| log_and_500("scan", e))?;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let results = pairs
+        .into_iter()
+        .map(|(key, value)| ScanEntry {
+            key,
+            value: b64.encode(&value),
+        })
+        .collect();
+    Ok(Json(ScanResponse { results }))
 }
 
 #[cfg(test)]
@@ -137,15 +206,41 @@ mod tests {
 
         async fn scan(
             &self,
-            _start: std::ops::Bound<String>,
-            _end: std::ops::Bound<String>,
-            _limit: usize,
+            start: std::ops::Bound<String>,
+            end: std::ops::Bound<String>,
+            limit: usize,
         ) -> Result<Vec<(String, Vec<u8>)>, EngineError> {
-            // The router does not (yet) expose `/scan`, so this mock impl is
-            // unused. Returns empty rather than panicking so any future
-            // accidental call from a test still produces a well-formed result.
-            Ok(Vec::new())
+            if self.take_failure() {
+                return Err(EngineError::Io(std::io::Error::other("armed failure")));
+            }
+            let mut entries: Vec<(String, Vec<u8>)> = self
+                .inner
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| in_range(k.as_str(), &start, &end))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.truncate(limit);
+            Ok(entries)
         }
+    }
+
+    /// `[start, end)` membership check used by `MockEngine::scan`.
+    fn in_range(key: &str, start: &std::ops::Bound<String>, end: &std::ops::Bound<String>) -> bool {
+        use std::ops::Bound::*;
+        let after_start = match start {
+            Included(s) => key >= s.as_str(),
+            Excluded(s) => key > s.as_str(),
+            Unbounded => true,
+        };
+        let before_end = match end {
+            Included(e) => key <= e.as_str(),
+            Excluded(e) => key < e.as_str(),
+            Unbounded => true,
+        };
+        after_start && before_end
     }
 
     fn router_with(engine: Arc<MockEngine>) -> Router {
@@ -382,5 +477,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // /kv scan endpoint
+    // -----------------------------------------------------------------------
+
+    /// Decode a base64 string back to bytes. Helper for asserting on response
+    /// values without the encoding obscuring the test intent.
+    fn b64_decode(s: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .unwrap()
+    }
+
+    async fn scan_json(app: Router, uri: &str) -> serde_json::Value {
+        let resp = app.oneshot(req(Method::GET, uri, vec![])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK for {}", uri);
+        let body = read_body(resp.into_body()).await;
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_empty_engine_returns_empty_results() {
+        let app = router_with(MockEngine::new());
+        let json = scan_json(app, "/kv").await;
+        assert_eq!(json["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_returns_sorted_keys() {
+        let app = router_with(MockEngine::new());
+
+        // PUT in non-sorted order — scan should return sorted.
+        for (k, v) in [("c", "C"), ("a", "A"), ("b", "B")] {
+            app.clone()
+                .oneshot(req(Method::PUT, &format!("/kv/{}", k), v.as_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+
+        let json = scan_json(app, "/kv").await;
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        for (i, expected_key) in ["a", "b", "c"].iter().enumerate() {
+            assert_eq!(results[i]["key"].as_str().unwrap(), *expected_key);
+        }
+        // Values round-trip through base64.
+        assert_eq!(b64_decode(results[0]["value"].as_str().unwrap()), b"A");
+        assert_eq!(b64_decode(results[1]["value"].as_str().unwrap()), b"B");
+        assert_eq!(b64_decode(results[2]["value"].as_str().unwrap()), b"C");
+    }
+
+    #[tokio::test]
+    async fn scan_respects_start_and_end() {
+        let app = router_with(MockEngine::new());
+        for k in ["a", "b", "c", "d", "e"] {
+            app.clone()
+                .oneshot(req(Method::PUT, &format!("/kv/{}", k), k.as_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+
+        // [b, d) — half-open. Expect b, c.
+        let json = scan_json(app, "/kv?start=b&end=d").await;
+        let keys: Vec<&str> = json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn scan_respects_limit() {
+        let app = router_with(MockEngine::new());
+        for k in ["a", "b", "c", "d", "e"] {
+            app.clone()
+                .oneshot(req(Method::PUT, &format!("/kv/{}", k), k.as_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+
+        let json = scan_json(app, "/kv?limit=2").await;
+        let keys: Vec<&str> = json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn scan_invalid_limit_returns_400() {
+        let app = router_with(MockEngine::new());
+        let resp = app
+            .oneshot(req(Method::GET, "/kv?limit=not-a-number", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn scan_engine_failure_returns_500() {
+        let engine = MockEngine::new();
+        engine.arm_failure();
+        let app = router_with(engine);
+
+        let resp = app
+            .oneshot(req(Method::GET, "/kv", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
