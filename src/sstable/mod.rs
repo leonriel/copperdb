@@ -5,6 +5,7 @@ use crate::sstable::{block::BlockError, reader::ReaderError, writer::WriterError
 pub mod block;
 pub mod reader;
 pub mod writer;
+pub mod iter;
 
 type MetaOffset = u64;
 type IndexOffset = u64;
