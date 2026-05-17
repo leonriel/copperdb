@@ -17,19 +17,26 @@ use crate::engine::EngineCore;
 use crate::memtable::MemTable;
 use crate::versioning::sst_path;
 
-/// Reads the engine at the current snapshot and returns up to `limit`
-/// live `(user_key, value)` pairs whose keys fall in `[start, end)` (with
-/// `Bound` flexibility on both ends), in ascending key order. Deletes are
-/// filtered out; only the newest version of each key is returned.
+/// Reads the engine at the current snapshot and returns an iterator over up
+/// to `limit` live `(user_key, value)` pairs whose keys fall in
+/// `[start, end)` (with `Bound` flexibility on both ends), in ascending key
+/// order. Deletes are filtered out; only the newest version of each key is
+/// returned.
+///
+/// The returned iterator is `'static` — it owns Arcs to the snapshotted
+/// memtables and the SSTable version, plus the open file handles for any
+/// SSTables it might read. Callers can hold it across `await` points or
+/// drop it mid-stream without leaking state.
 pub(super) fn scan_impl(
     core: &EngineCore,
     start: Bound<&str>,
     end: Bound<&str>,
     limit: usize,
-) -> io::Result<Vec<(String, Vec<u8>)>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
+) -> io::Result<ScanFilter> {
+    // Build the snapshot + per-source iterators even when limit == 0; the
+    // ScanFilter's while-condition (`self.yielded < self.limit`) will then
+    // short-circuit on the first call to `next()`. Slightly more work than
+    // an explicit early-return, but keeps the construction path uniform.
 
     // 1. Snapshot memtables + SSTable version. Each Arc clone pins the
     //    relevant storage for the duration of this scan; concurrent flushes
@@ -73,25 +80,28 @@ pub(super) fn scan_impl(
         }
     }
 
-    // 3. Merge + filter.
+    // 3. Merge + filter. The ScanFilter is returned as an iterator — the
+    //    caller drives it lazily and can stop early by dropping it.
     let merging = MergingIterator::new(iterators);
-    let filter = ScanFilter {
+    Ok(ScanFilter {
         inner: merging,
         start: bound_to_owned(start),
         end: bound_to_owned(end),
         last_key: None,
         yielded: 0,
         limit,
-    };
-
-    Ok(filter.collect_vec())
+    })
 }
 
 /// Adapter over `MergingIterator` that produces the read-visible scan
 /// output: one live `(key, value)` per user_key (newest version), bounded by
 /// `end` and `limit`. Tombstones are consumed silently and suppress that
 /// key entirely.
-struct ScanFilter {
+///
+/// Exposed as a public `Iterator` from `LsmEngine::scan` so callers can
+/// process results lazily — useful for large ranges where materialising
+/// the full `Vec` upfront would cost memory.
+pub(crate) struct ScanFilter {
     inner: MergingIterator,
     start: Bound<String>,
     end: Bound<String>,
@@ -100,48 +110,43 @@ struct ScanFilter {
     limit: usize,
 }
 
-impl ScanFilter {
-    fn collect_vec(mut self) -> Vec<(String, Vec<u8>)> {
-        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+impl Iterator for ScanFilter {
+    type Item = (String, Vec<u8>);
+
+    fn next(&mut self) -> Option<(String, Vec<u8>)> {
         while self.yielded < self.limit {
-            match self.inner.next() {
-                None => break,
-                Some((key, record, _seq)) => {
-                    // Upper-bound check first — entries are emitted in
-                    // ascending order, so once we cross `end` we're done.
-                    if past_end(&key, &self.end) {
-                        break;
-                    }
-                    // Lower-bound check. Memtable iterators are already
-                    // bounded, but SSTable iterators walk the whole file —
-                    // so without this filter, sub-start keys from SSTables
-                    // leak through. We skip without touching `last_key`
-                    // because no key < start can ever be one we'd yield
-                    // later (entries arrive in ascending order).
-                    if before_start(&key, &self.start) {
-                        continue;
-                    }
-                    // Dedup: skip older versions of an already-emitted key.
-                    if self.last_key.as_deref() == Some(key.as_str()) {
-                        continue;
-                    }
-                    self.last_key = Some(key.clone());
-                    // Drop tombstones — they suppress the key from output.
-                    match record {
-                        Record::Put(value) => {
-                            out.push((key, value));
-                            self.yielded += 1;
-                        }
-                        Record::Delete => {
-                            // Tombstone consumed; `last_key` was bumped above
-                            // so the next-older Put for the same key is also
-                            // skipped on its own iteration.
-                        }
-                    }
+            let (key, record, _seq) = self.inner.next()?;
+
+            // Upper-bound check first — entries arrive in ascending key
+            // order, so once we cross `end` no later entry can match.
+            if past_end(&key, &self.end) {
+                return None;
+            }
+            // Lower-bound check. Memtable iterators are already bounded,
+            // but SSTable iterators walk the whole file — so without this
+            // filter, sub-start keys from SSTables would leak through. We
+            // skip without touching `last_key`: no key < start can ever be
+            // one we'd yield later (ascending order).
+            if before_start(&key, &self.start) {
+                continue;
+            }
+            // Dedup: skip older versions of an already-emitted key.
+            if self.last_key.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            self.last_key = Some(key.clone());
+            // Drop tombstones — they suppress the key from output. The
+            // `last_key` bump above ensures any older `Put` for the same
+            // key is also skipped on its own iteration.
+            match record {
+                Record::Put(value) => {
+                    self.yielded += 1;
+                    return Some((key, value));
                 }
+                Record::Delete => continue,
             }
         }
-        out
+        None
     }
 }
 
