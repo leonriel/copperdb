@@ -1,0 +1,14 @@
+# YCSB-E — 95% short range scans / 5% inserts, Zipfian start keys.
+#
+# Models email-threading / activity-stream workloads: read a window of
+# recent records, occasionally append a new one. Each scan picks a random
+# start key (Zipfian) and a random length in [1, max_scan_length].
+
+name = "YCSB-E"
+description = "Read-mostly range scans with new-record inserts; Zipfian start keys"
+keys = 1_000_000
+value_size = 1024
+key_distribution = "zipfian"
+zipfian_theta = 0.99
+op_mix = { read = 0.0, update = 0.0, insert = 0.05, rmw = 0.0, scan = 0.95 }
+max_scan_length = 100

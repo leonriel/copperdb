@@ -123,8 +123,10 @@ remain useful for quick smoke tests during development.
 | `--update-pct <f>`         | `0.5`              | Fraction of ops that are updates.    |
 | `--insert-pct <f>`         | `0.0`              | Fraction that are inserts (grows key space). |
 | `--rmw-pct <f>`            | `0.0`              | Fraction that are read-modify-write. |
+| `--scan-pct <f>`           | `0.0`              | Fraction that are range scans.       |
+| `--max-scan-length <N>`    | `100`              | Upper bound on per-scan record count (uniform [1, N]). |
 
-The four `--*-pct` flags must sum to `1.0`. If `--config` is set, the TOML
+The five `--*-pct` flags must sum to `1.0`. If `--config` is set, the TOML
 provides the workload and CLI flags act as field-level overrides; setting
 *any* `--*-pct` flag replaces the entire op mix wholesale (to keep the
 sum-to-1 invariant).
@@ -225,5 +227,3 @@ spikes in time; the summary is the authoritative tail-latency view.
 
 - **Sleep precision on macOS.** See the closed-loop caveat above. Linux is
   the answer.
-- **No `scan` workload (YCSB-E).** `LsmEngine` has no public `scan` API;
-  adding one is a separate engine feature, not part of the harness phasing.
