@@ -16,11 +16,12 @@ cargo run --release --bin bench -- \
 | `ycsb-b.toml` | B         | 95% read / 5% update          | Zipfian (θ=0.99)  | Read-mostly with light updates     |
 | `ycsb-c.toml` | C         | 100% read                     | Zipfian (θ=0.99)  | Read-only baseline                 |
 | `ycsb-d.toml` | D         | 95% read / 5% insert          | Latest            | Read-latest with growing key space |
+| `ycsb-e.toml` | E         | 95% scan / 5% insert          | Zipfian (θ=0.99)  | Short range scans (length 1–100)   |
 | `ycsb-f.toml` | F         | 50% read / 50% RMW            | Zipfian (θ=0.99)  | Read-modify-write                  |
 
-YCSB-E (short range scans) is intentionally omitted — `LsmEngine` does not
-yet expose a public scan API. Adding one is a separate engine feature, not
-part of the benchmark harness.
+YCSB-E uses range scans with per-op length sampled uniformly from
+`[1, max_scan_length]` (default `100`, matching the YCSB paper). Override
+via `--max-scan-length`.
 
 All presets default to **1 million keys × 1 KB values**. Override any field
 at run time with the corresponding CLI flag (e.g. `--keys 10000`), or copy a
