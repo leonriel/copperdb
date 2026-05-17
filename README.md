@@ -2,7 +2,7 @@
 
 CopperDB is a persistent key-value store built in Rust, powered by an
 LSM-tree storage engine. It exposes a simple HTTP API for reading, writing,
-and deleting keys.
+deleting, and range-scanning keys.
 
 Internally, writes are first appended to a write-ahead log (WAL) for
 durability, then inserted into an in-memory memtable backed by a concurrent
@@ -73,6 +73,55 @@ Returns `204 No Content`. Deleting a non-existent key is a no-op.
 ```sh
 curl -X DELETE http://localhost:8080/kv/city
 ```
+
+### Range scan
+
+```
+GET /kv?start=<key>&end=<key>&limit=<N>
+```
+
+Returns up to `limit` key-value pairs whose keys fall in the half-open
+range `[start, end)`, in ascending key order. All three query parameters
+are optional:
+
+| Parameter | Default     | Meaning                                |
+|-----------|-------------|----------------------------------------|
+| `start`   | unbounded   | Inclusive lower bound on the key range |
+| `end`     | unbounded   | Exclusive upper bound                  |
+| `limit`   | `1000`      | Maximum results returned               |
+
+The response is JSON. Values are base64-encoded because the engine stores
+arbitrary bytes and JSON has no native binary type:
+
+```json
+{
+  "results": [
+    {"key": "apple",  "value": "cmVk"},
+    {"key": "banana", "value": "eWVsbG93"}
+  ]
+}
+```
+
+Returns `200 OK` for any well-formed request (including empty results),
+`400 Bad Request` if a query parameter fails to parse, or `500 Internal
+Server Error` if the engine surfaces an I/O error.
+
+```sh
+# Full scan (capped at 1000 entries).
+curl http://localhost:8080/kv
+
+# Bounded scan: keys in [banana, fig), at most 50 results.
+curl 'http://localhost:8080/kv?start=banana&end=fig&limit=50'
+
+# Decode a value back to raw bytes.
+curl 'http://localhost:8080/kv?limit=1' | jq -r '.results[0].value' | base64 -d
+```
+
+Note the encoding asymmetry: single-key `GET /kv/{key}` returns raw bytes
+as the response body, whereas the scan endpoint base64-encodes each value
+inside a JSON wrapper. The scan needs a serialisation format that can pack
+multiple values into one response; JSON forces an encoding step that the
+single-key endpoint doesn't have to make.
 
 ## Running tests
 
