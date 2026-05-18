@@ -11,10 +11,11 @@ use std::io;
 use std::ops::Bound;
 use std::path::Path;
 
-use crate::compaction::{MergingIterator, SsTableIterator};
+use crate::core::merge::MergingIterator;
 use crate::core::{KvIterator, Record};
 use crate::engine::EngineCore;
 use crate::memtable::MemTable;
+use crate::sstable::iter::SsTableIterator;
 use crate::versioning::sst_path;
 
 /// Reads the engine at the current snapshot and returns an iterator over up

@@ -1,6 +1,7 @@
 use std::cmp;
 
 pub mod storage;
+pub(crate) mod merge;
 pub use storage::{EngineError, StorageEngine};
 
 #[derive(thiserror::Error, Debug)]
