@@ -42,6 +42,19 @@ pub enum CompactionError {
     SSTable(String),
 }
 
+/// Absorb `SsTableIterator::IterError` into `CompactionError` so the
+/// compactor can keep using `?` against `SsTableIterator::open(...)`
+/// without splitting variants in the iterator's error type to match
+/// our own.
+impl From<crate::sstable::iter::IterError> for CompactionError {
+    fn from(e: crate::sstable::iter::IterError) -> Self {
+        match e {
+            crate::sstable::iter::IterError::Io(io) => CompactionError::Io(io),
+            crate::sstable::iter::IterError::Corrupt(msg) => CompactionError::SSTable(msg),
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Background worker entry point

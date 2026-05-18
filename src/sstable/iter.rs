@@ -1,19 +1,55 @@
-// ---------------------------------------------------------------------------
-// SsTableIterator — full sequential scan of one SSTable file
-// ---------------------------------------------------------------------------
+//! Sequential block-by-block scan over a single SSTable file.
+//!
+//! [`SsTableIterator`] opens an SSTable, walks the two-level index to
+//! collect every data-block byte range, then yields `(user_key, record,
+//! seq_num)` entries one block at a time in on-disk (sorted) order. It
+//! implements [`KvIterator`] so it plugs directly into
+//! [`MergingIterator`](crate::core::merge::MergingIterator) as one of N
+//! merge sources.
+//!
+//! Two consumers in the codebase:
+//!   - the compaction worker (`src/compaction/mod.rs`) reads each input
+//!     file end-to-end during a level-to-level merge,
+//!   - [`LsmEngine::scan`](crate::engine::LsmEngine::scan) (via
+//!     `src/engine/scan.rs`) wraps every L0 and L1+ file overlapping the
+//!     scan range as a merge input alongside the memtable iterators.
+//!
+//! The iterator owns its [`File`] handle and the decoded block-range
+//! table, so it's `'static` and can move across thread boundaries
+//! without lifetime constraints. It does **not** seek into the middle
+//! of the file — every call to `open` starts streaming from the first
+//! data block. Callers that want a sub-range filter the output
+//! downstream (e.g. `ScanFilter` in the scan path).
+//!
+//! For point lookups within a single SSTable see
+//! [`SsTableReader`](crate::sstable::reader::SsTableReader); for the
+//! sequential pass the iterator is the right tool.
 
-use std::{fs::File, io::SeekFrom};
-use std::io::{Read, Seek};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::core::KvIterator;
+use crate::core::{InternalKey, KvIterator, Record};
 use crate::sstable::block::Block;
-use crate::sstable::{INDEX_OFFSET_SIZE, MAGIC_NUMBER, META_OFFSET_SIZE};
-use crate::{compaction::CompactionError, core::{InternalKey, Record}, sstable::FOOTER_SIZE};
+use crate::sstable::{FOOTER_SIZE, INDEX_OFFSET_SIZE, MAGIC_NUMBER, META_OFFSET_SIZE};
 
-/// Reads an SSTable file block-by-block and yields every (key, record, seq_num)
-/// entry in on-disk (sorted) order. Used as one input stream to `MergingIterator`
-/// — both by the compactor and by `LsmEngine::scan`.
+/// Errors surfaced by [`SsTableIterator`]. Lives alongside the iterator
+/// rather than under `compaction` so the `sstable` module isn't forced to
+/// depend on its consumers — every other crate-internal consumer (e.g.
+/// `compaction::CompactionError`) can absorb this via `From`.
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum IterError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    /// Format-level problem reading the SSTable: short file, bad magic
+    /// number, malformed footer, corrupt index entry, etc. Distinct from
+    /// `Io` so callers can distinguish "disk problem" from "this file is
+    /// not a valid SSTable."
+    #[error("SSTable corruption: {0}")]
+    Corrupt(String),
+}
+
 pub(crate) struct SsTableIterator {
     file: File,
     /// Byte ranges for each data block: (start_inclusive, end_exclusive).
@@ -27,12 +63,12 @@ pub(crate) struct SsTableIterator {
 }
 
 impl SsTableIterator {
-    pub(crate) fn open(path: &Path) -> Result<Self, CompactionError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, IterError> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
         if file_len < FOOTER_SIZE as u64 {
-            return Err(CompactionError::SSTable(format!(
+            return Err(IterError::Corrupt(format!(
                 "SSTable {:?} is too short to contain a valid footer ({} bytes)",
                 path, file_len,
             )));
@@ -46,25 +82,25 @@ impl SsTableIterator {
         let meta_offset = u64::from_be_bytes(
             footer_buf[0..META_OFFSET_SIZE]
                 .try_into()
-                .map_err(|_| CompactionError::SSTable("Failed to parse meta offset".to_string()))?,
+                .map_err(|_| IterError::Corrupt("Failed to parse meta offset".to_string()))?,
         );
 
         let index_offset_offset = META_OFFSET_SIZE;
         let index_offset = u64::from_be_bytes(
             footer_buf[index_offset_offset..index_offset_offset + INDEX_OFFSET_SIZE]
                 .try_into()
-                .map_err(|_| CompactionError::SSTable("Failed to parse index offset".to_string()))?,
+                .map_err(|_| IterError::Corrupt("Failed to parse index offset".to_string()))?,
         );
 
         let magic_offset = META_OFFSET_SIZE + INDEX_OFFSET_SIZE;
         let magic = u64::from_be_bytes(
             footer_buf[magic_offset..]
                 .try_into()
-                .map_err(|_| CompactionError::SSTable("Failed to parse magic number".to_string()))?,
+                .map_err(|_| IterError::Corrupt("Failed to parse magic number".to_string()))?,
         );
 
         if magic != MAGIC_NUMBER {
-            return Err(CompactionError::SSTable(format!(
+            return Err(IterError::Corrupt(format!(
                 "SSTable {:?} has invalid magic number: {:#018X}",
                 path, magic,
             )));
@@ -83,15 +119,15 @@ impl SsTableIterator {
         let top_index = Block::decode(top_index_data);
 
         // Helper: decode an 8-byte big-endian u64 offset from an index entry.
-        let decode_offset = |record: Record| -> Result<u64, CompactionError> {
+        let decode_offset = |record: Record| -> Result<u64, IterError> {
             match record {
                 Record::Put(v) => {
                     let arr: [u8; 8] = v.try_into().map_err(|_| {
-                        CompactionError::SSTable("Index pointer is not 8 bytes".to_string())
+                        IterError::Corrupt("Index pointer is not 8 bytes".to_string())
                     })?;
                     Ok(u64::from_be_bytes(arr))
                 }
-                Record::Delete => Err(CompactionError::SSTable(
+                Record::Delete => Err(IterError::Corrupt(
                     "Index block contains a Delete record".to_string(),
                 )),
             }
@@ -101,25 +137,25 @@ impl SsTableIterator {
         // disk and collect every data-block offset it points at.
         let n_top = top_index
             .get_num_offsets()
-            .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+            .map_err(|e| IterError::Corrupt(e.to_string()))?;
 
         let mut block_starts: Vec<u64> = Vec::new();
         for top_i in 0..n_top {
             let top_entry_offset = top_index
                 .get_offset(top_i, n_top)
-                .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                .map_err(|e| IterError::Corrupt(e.to_string()))?;
             let (_, top_record) = top_index
                 .decode_entry(top_entry_offset)
-                .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                .map_err(|e| IterError::Corrupt(e.to_string()))?;
             let l1_start = decode_offset(top_record)?;
 
             let l1_end = if top_i + 1 < n_top {
                 let next_top_entry_offset = top_index
                     .get_offset(top_i + 1, n_top)
-                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                    .map_err(|e| IterError::Corrupt(e.to_string()))?;
                 let (_, next_top_record) = top_index
                     .decode_entry(next_top_entry_offset)
-                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                    .map_err(|e| IterError::Corrupt(e.to_string()))?;
                 decode_offset(next_top_record)?
             } else {
                 top_index_offset
@@ -133,14 +169,14 @@ impl SsTableIterator {
 
             let n_l1 = l1_block
                 .get_num_offsets()
-                .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                .map_err(|e| IterError::Corrupt(e.to_string()))?;
             for j in 0..n_l1 {
                 let entry_offset = l1_block
                     .get_offset(j, n_l1)
-                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                    .map_err(|e| IterError::Corrupt(e.to_string()))?;
                 let (_, record) = l1_block
                     .decode_entry(entry_offset)
-                    .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+                    .map_err(|e| IterError::Corrupt(e.to_string()))?;
                 block_starts.push(decode_offset(record)?);
             }
         }
@@ -168,7 +204,7 @@ impl SsTableIterator {
 
     /// Load the next data block from disk into `current_entries`. Returns `true`
     /// if a block was loaded, `false` if there are no more blocks.
-    fn load_next_block(&mut self) -> Result<bool, CompactionError> {
+    fn load_next_block(&mut self) -> Result<bool, IterError> {
         if self.next_block_idx >= self.block_ranges.len() {
             return Ok(false);
         }
@@ -184,7 +220,7 @@ impl SsTableIterator {
         let block = Block::decode(data);
         self.current_entries = block
             .iter_all()
-            .map_err(|e| CompactionError::SSTable(e.to_string()))?;
+            .map_err(|e| IterError::Corrupt(e.to_string()))?;
         self.current_entry_idx = 0;
 
         Ok(true)
@@ -217,13 +253,10 @@ impl KvIterator for SsTableIterator {
 mod tests {
     use super::*;
     use crate::sstable::writer::SsTableBuilder;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn sstable_iterator_reads_all_entries() {
-        use crate::sstable::writer::SsTableBuilder;
-        use std::sync::atomic::AtomicUsize;
-
         static CNT: AtomicUsize = AtomicUsize::new(0);
         let id = CNT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -273,8 +306,6 @@ mod tests {
     /// iterates it end-to-end and verifies entry count + sorted order.
     #[test]
     fn sstable_iterator_walks_multi_l1() {
-        use std::sync::atomic::AtomicUsize;
-
         static CNT: AtomicUsize = AtomicUsize::new(0);
         let id = CNT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(

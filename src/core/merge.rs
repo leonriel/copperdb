@@ -1,6 +1,25 @@
-// ---------------------------------------------------------------------------
-// MergingIterator — K-way merge using a min-heap
-// ---------------------------------------------------------------------------
+//! K-way merge over the [`KvIterator`] trait.
+//!
+//! [`MergingIterator`] consumes any number of pre-sorted `KvIterator`
+//! sources and yields their union in sorted order. The merge respects
+//! [`InternalKey`]'s ordering — `user_key` ascending, `seq_num` descending
+//! for the same user_key — so the newest version of a duplicated key
+//! always emerges first. Callers layer their own dedup / tombstone logic
+//! on top: compaction in `src/compaction/mod.rs` drops shadowed entries
+//! and (at the bottommost level) tombstones; scans use `ScanFilter` in
+//! `src/engine/scan.rs` for the same purpose.
+//!
+//! This module lives in `core` rather than alongside any one consumer
+//! because the merge is format-agnostic — it doesn't know whether its
+//! sources are SSTable iterators, memtable iterators, or anything else
+//! implementing `KvIterator`. The sole concrete type, `MergingIterator`,
+//! is `pub(crate)` so it's reachable from `compaction` and `engine`
+//! without leaking outside the crate.
+//!
+//! Implementation: a [`BinaryHeap`](std::collections::BinaryHeap) of
+//! `HeapEntry` per source, with the `Ord` impl reversed so the smallest
+//! `InternalKey` has highest priority — turning Rust's max-heap into a
+//! min-heap without wrapping every entry in `Reverse`.
 
 use std::{cmp::Ordering, collections::BinaryHeap};
 
@@ -41,8 +60,6 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// Merges N sorted iterators into one sorted stream using a binary min-heap.
-/// Used by the compactor and by `LsmEngine::scan`.
 pub(crate) struct MergingIterator {
     iterators: Vec<Box<dyn KvIterator>>,
     heap: BinaryHeap<HeapEntry>,
@@ -88,7 +105,7 @@ impl KvIterator for MergingIterator {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::core::{KvIterator, Record, merge::MergingIterator};
 
     #[test]
