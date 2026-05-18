@@ -2,13 +2,14 @@
 """Run a YCSB workload N times and aggregate the statistics.
 
 Usage:
-  scripts/bench-sweep.py <workload-letter> <N> [--base-seed S] [-o [PATH]] -- <bench args>
+  scripts/bench-sweep.py <workload-letter> <N> [--base-seed S] [-o [PATH]] [-m SIZE] -- <bench args>
 
 Example:
   scripts/bench-sweep.py a 5 -- --threads 4 --duration 30
   scripts/bench-sweep.py e 10 --base-seed 100 -- --keys 5000 --value-size 256
   scripts/bench-sweep.py a 5 -o -- --threads 4   # auto-named file under bench-results/
   scripts/bench-sweep.py a 5 -o foo.txt          # explicit path
+  scripts/bench-sweep.py e 5 -m 64M -o -- --threads 4 --duration 30   # 64 MiB memtable
 
 The script invokes target/release/bench once per iteration with seed =
 base_seed + i, parses the printed summary, and prints a table of
@@ -21,6 +22,11 @@ With `--output`, the same content is also written to disk. Without an
 explicit path, the file lands at
 `bench-results/ycsb-<letter>_N<n>_<bench-args>_<timestamp>.txt` under the
 repo root.
+
+`--memtable-size` (alias `-m`) is a script-level convenience for the
+bench's `--memtable-size`. Accepts IEC suffixes (`64M`, `1G`) so you
+don't have to spell out byte counts. If the same flag is also passed
+through after `--`, the pass-through wins (explicit beats implicit).
 """
 
 from __future__ import annotations
@@ -119,6 +125,32 @@ def run_one(
             )
             raise SystemExit(proc.returncode)
         return parse_summary(proc.stdout)
+
+
+def parse_size(s: str) -> int:
+    """Parse a byte count with optional unit suffix.
+
+    Accepts plain integers ("204800"), K/M/G suffixes ("64M"), or the
+    fully-spelled IEC variants ("64MiB"). Units are always powers of 2:
+    K == KiB == 1024, M == MiB == 1024**2, G == GiB == 1024**3.
+    """
+    multipliers = {
+        "": 1, "B": 1,
+        "K": 1024, "KB": 1024, "KIB": 1024,
+        "M": 1024 ** 2, "MB": 1024 ** 2, "MIB": 1024 ** 2,
+        "G": 1024 ** 3, "GB": 1024 ** 3, "GIB": 1024 ** 3,
+    }
+    m = re.match(r"^\s*(\d+)\s*([A-Za-z]*)\s*$", s)
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid size: {s!r}")
+    n = int(m.group(1))
+    unit = m.group(2).upper()
+    if unit not in multipliers:
+        raise argparse.ArgumentTypeError(
+            f"unknown size unit {m.group(2)!r}; expected one of "
+            f"{sorted(u for u in multipliers if u)}"
+        )
+    return n * multipliers[unit]
 
 
 def fmt(value: float | None, width: int = 14) -> str:
@@ -221,6 +253,16 @@ def main() -> None:
              "`bench-results/` with workload + N + bench args + timestamp "
              "in the filename. With a value, use that exact path.",
     )
+    ap.add_argument(
+        "-m", "--memtable-size",
+        type=parse_size,
+        default=None,
+        metavar="SIZE",
+        help="Memtable byte budget. Accepts plain integers or IEC suffixes "
+             "(`64M`, `1G`, etc.; powers of 2). Forwarded to the bench as "
+             "`--memtable-size <bytes>`. If `--memtable-size` is also passed "
+             "after `--`, that pass-through wins (so explicit beats implicit).",
+    )
     ap.epilog = (
         "Pass bench args after `--`, e.g. "
         "`scripts/bench-sweep.py a 5 -o -- --threads 4 --duration 30`."
@@ -239,6 +281,17 @@ def main() -> None:
 
     args = ap.parse_args(script_argv)
     extra_args = bench_args
+
+    # Merge the script-level --memtable-size into the bench args unless the
+    # user passed it explicitly through `--`. Doing it here means everything
+    # downstream (filename slug, bench invocation, file header) sees the
+    # same arg list — the script-level flag is just a convenient shortcut
+    # over typing it through.
+    if args.memtable_size is not None and not any(
+        a == "--memtable-size" or a.startswith("--memtable-size=")
+        for a in extra_args
+    ):
+        extra_args = ["--memtable-size", str(args.memtable_size)] + extra_args
 
     workload_path = WORKLOADS / f"ycsb-{args.workload.lower()}.toml"
     if not workload_path.is_file():
